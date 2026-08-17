@@ -1,0 +1,545 @@
+//@version=6
+// ══════════════════════════════════════════════════════════════════════════════
+// SWING VALIDATOR + ALLYOUNEED FUSION V1
+// Swings + Validator adaptatif (LTF) + AllYouNeed-like (Swing + Sup/Res + Fibo)
+// Anti-Repainting: Signaux confirmés à clôture des bougies (chart + LTF validator)
+// ══════════════════════════════════════════════════════════════════════════════
+
+//@version=6
+indicator('Swing Validator + AllYouNeed Fusion V1', overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=200)
+
+// ══════════════════════════════════════════
+//  SECTION 1: INPUTS - PIVOTS & TIMEFRAMES
+// ══════════════════════════════════════════
+grp0 = "⚙️ Pivot Configuration"
+autoTf = input.bool(true, title="Auto TF Pivot ?", group=grp0,
+         tooltip="Auto-ajuste lbLeft/lbRight selon le TF du chart")
+
+autoLbLeft  = timeframe.isdaily  ? 20 : timeframe.in_seconds() >= 14400 ? 20 : timeframe.in_seconds() >= 3600 ? 15 : timeframe.in_seconds() >= 1800 ? 10 : timeframe.in_seconds() >= 900 ? 8 : 5
+autoLbRight = timeframe.isdaily  ? 15 : timeframe.in_seconds() >= 14400 ? 15 : timeframe.in_seconds() >= 3600 ? 10 : timeframe.in_seconds() >= 1800 ? 8  : timeframe.in_seconds() >= 900 ? 6 : 4
+autoCooldown= timeframe.isdaily  ? 5  : timeframe.in_seconds() >= 14400 ? 5  : timeframe.in_seconds() >= 3600 ? 8  : timeframe.in_seconds() >= 1800 ? 10 : timeframe.in_seconds() >= 900 ? 12 : 15
+
+manLbLeft   = input.int(20, title="Pivot Left Bars (manuel)",  minval=1, group=grp0)
+manLbRight  = input.int(15, title="Pivot Right Bars (manuel)", minval=1, group=grp0)
+manCooldown = input.int(5,  title="Cooldown (manuel)",         minval=0, group=grp0)
+
+lbLeft  = autoTf ? autoLbLeft   : manLbLeft
+lbRight = autoTf ? autoLbRight  : manLbRight
+cooldownPeriod = autoTf ? autoCooldown : manCooldown
+
+// ══════════════════════════════════════════
+//  SECTION 2: INPUTS - VALIDATEUR LTF ADAPTATIF
+// ══════════════════════════════════════════
+grp_val_tf = "🎯 TF Validateur Adaptatif"
+autoValidatorTf = input.bool(true, title="Auto TF Validateur (1 cran en dessous) ?", group=grp_val_tf,
+                  tooltip="Daily→H4 | H4→H1 | H1→M15 | M30→M5")
+manValidatorTf  = input.string("15", title="TF Validateur (manuel)", options=["1","5","15","30","60","240"], group=grp_val_tf)
+
+grp_val = "✅ ENTRY VALIDATOR (LTF) - 3/4 MINIMUM"
+showValidator = input.bool(true, title="Afficher validateur ?", group=grp_val)
+m15VolumeThreshold = input.float(1.2, title="Vol Boost multiplier", minval=0.5, maxval=3.0, step=0.1, group=grp_val,
+                     tooltip="Volume > SMA(20) × ce multiplicateur")
+m15BodyThreshold = input.float(0.4, title="Body Clear ratio", minval=0.1, maxval=0.9, step=0.05, group=grp_val,
+                   tooltip="Corps > X% de la range")
+useFreshPivot = input.bool(true, title="Inclure 'Pivot M15 frais' dans verdict?", group=grp_val,
+                 tooltip="Si OFF: condition optionnelle. Si ON: compte dans les 3/4")
+ltfFreshPivotBars = input.int(4, title="Pivot frais si < X bougies LTF", minval=1, maxval=20, group=grp_val)
+
+grp_val_table = "📐 Tableau Validator"
+valTableSize = input.string("Normal", title="Taille", options=["Compact","Normal","Grand","Très Grand"], group=grp_val_table)
+valTablePos  = input.string("Haut droite", title="Position", options=["Haut droite","Haut gauche","Bas droite","Bas gauche","Milieu droite"], group=grp_val_table)
+
+// ══════════════════════════════════════════
+//  SECTION 3: INPUTS - ALLYOUNEED-LIKE DETECTION
+// ══════════════════════════════════════════
+grp_ayn = "🎨 AllYouNeed-like Detection"
+ayneMode = input.string("Mode B: Swing+Sup/Res+Fibo", title="AllYouNeed Mode", 
+           options=["Mode A: Swing Only", "Mode B: Swing+Sup/Res+Fibo", "Mode C: Custom"], group=grp_ayn)
+showAYNSignals = input.bool(true, title="Afficher signaux AYN ?", group=grp_ayn)
+aynSwingLookback = input.int(20, title="Lookback pour Sup/Res", minval=5, maxval=50, group=grp_ayn)
+aynFiboEnable = input.bool(true, title="Inclure Fibonacci ?", group=grp_ayn)
+
+// ══════════════════════════════════════════
+//  SECTION 4: INPUTS - ATR TP/SL
+// ══════════════════════════════════════════
+grp3 = "🎯 ATR — TP / SL"
+atrLen   = input.int(14, title="ATR Période", minval=1, group=grp3)
+atrSlMul = input.float(1.5, title="SL = ATR × (standard)", minval=0.1, step=0.1, group=grp3)
+atrSlMulReduced = input.float(0.7, title="SL = ATR × (si validé)", minval=0.1, step=0.1, group=grp3)
+atrTpRR  = input.float(2.5, title="TP R:R", minval=0.1, step=0.1, group=grp3)
+useMtfAtr = input.bool(false, title="Utiliser ATR TF supérieure ?", group=grp3)
+
+entryClr    = input.color(color.new(#FFEB3B, 0), title="Entry color", group=grp3)
+tpClr       = input.color(color.new(#4CAF50, 0), title="TP color", group=grp3)
+slClr       = input.color(color.new(#F44336, 0), title="SL color", group=grp3)
+showRRLbl   = input.bool(true, title="Afficher R:R ?", group=grp3)
+
+// ══════════════════════════════════════════
+//  SECTION 5: INPUTS - FILTRES
+// ══════════════════════════════════════════
+grp4 = "🔍 Filtres"
+useRsi    = input.bool(true, title="✅ RSI Momentum", group=grp4)
+rsiLen    = input.int(14, title="RSI période", minval=1, group=grp4)
+rsiMidBull = input.float(50, title="RSI seuil BULL", minval=1, maxval=99, group=grp4)
+rsiMidBear = input.float(50, title="RSI seuil BEAR", minval=1, maxval=99, group=grp4)
+useEma    = input.bool(false, title="✅ EMA Trend", group=grp4)
+emaFast   = input.int(21, title="EMA rapide", minval=1, group=grp4)
+emaSlow   = input.int(50, title="EMA lente", minval=1, group=grp4)
+
+// ══════════════════════════════════════════
+//  SECTION 6: INPUTS - SESSIONS & DISPLAY
+// ══════════════════════════════════════════
+grp_session = "🌍 Filtre Session"
+useSessionFilter = input.bool(false, title="Filtrer Londres/NY ?", group=grp_session)
+londonSession = input.session("0900-1730", title="Londres (Europe/Paris)", group=grp_session)
+nySession = input.session("1430-2200", title="New York (Europe/Paris)", group=grp_session)
+
+grp5 = "📈 Affichage"
+maxTrades   = input.int(10, title="Nb trades affichés", minval=1, maxval=50, group=grp5)
+extBars     = input.int(3, title="Extension lignes", minval=1, maxval=10, group=grp5)
+showConfluenceTable = input.bool(true, title="Afficher tableau Confluence ?", group=grp5)
+confluenceTablePos = input.string("Milieu droite", title="Position Confluence", 
+                     options=["Haut droite","Haut gauche","Bas droite","Bas gauche","Milieu droite"], group=grp5)
+confluenceTableSize = input.string("Normal", title="Taille Confluence", options=["Compact","Normal","Grand","Très Grand"], group=grp5)
+
+grp7 = "📊 Tableau Stats"
+showTable    = input.bool(true, title="Afficher stats ?", group=grp7)
+tablePos     = input.string("Bas droite", title="Position Stats",
+               options=["Haut droite","Haut gauche","Bas droite","Bas gauche","Milieu droite"], group=grp7)
+tableTxtSize = input.string(size.small, title="Taille texte",
+               options=[size.tiny, size.small, size.normal, size.large], group=grp7)
+lookForward  = input.int(50, title="Fenêtre résultat (barres)", minval=5, maxval=5000, group=grp7)
+
+grp_late = "⏰ Entrée Tardive"
+showLateEntryHelper = input.bool(true, title="Afficher aide entrée tardive ?", group=grp_late)
+lateEntryMinRR = input.float(2.5, title="R:R à préserver", minval=0.5, step=0.1, group=grp_late)
+lateEntryMinAtrFrac = input.float(0.3, title="SL min = ATR ×", minval=0.05, step=0.05, group=grp_late)
+lateEntryTablePos = input.string("Haut gauche", title="Position", 
+                     options=["Haut droite","Haut gauche","Bas droite","Bas gauche","Milieu droite"], group=grp_late)
+lateEntryTableSize = input.string("Normal", title="Taille", options=["Compact","Normal","Grand","Très Grand"], group=grp_late)
+
+// ══════════════════════════════════════════
+//  SECTION 7: UTILITY FUNCTIONS
+// ══════════════════════════════════════════
+priceStr(p) => str.tostring(math.round(p, 5))
+pct(n, d)   => d == 0 ? "—" : str.tostring(math.round(n / d * 100, 1)) + "%"
+
+tablePosition(p) =>
+    switch p
+        "Haut droite"   => position.top_right
+        "Haut gauche"   => position.top_left
+        "Bas droite"    => position.bottom_right
+        "Bas gauche"    => position.bottom_left
+        "Milieu droite" => position.middle_right
+        => position.bottom_right
+
+valTextSize(s) =>
+    switch s
+        "Compact"     => size.tiny
+        "Normal"      => size.small
+        "Grand"       => size.normal
+        "Très Grand"  => size.large
+        => size.small
+
+tfLabel() =>
+    timeframe.isdaily ? "D1" : timeframe.in_seconds() >= 14400 ? "H4" : timeframe.in_seconds() >= 3600 ? "H1" : timeframe.in_seconds() >= 1800 ? "M30" : timeframe.in_seconds() >= 900 ? "M15" : "M5"
+
+getAutoValidatorTf() =>
+    if timeframe.isdaily
+        "240"
+    else if timeframe.in_seconds() >= 14400
+        "60"
+    else if timeframe.in_seconds() >= 3600
+        "15"
+    else if timeframe.in_seconds() >= 1800
+        "5"
+    else if timeframe.in_seconds() >= 900
+        "5"
+    else
+        "1"
+
+valTF = autoValidatorTf ? getAutoValidatorTf() : manValidatorTf
+
+valTfSeconds(tfStr) =>
+    switch tfStr
+        "1"    => 60
+        "5"    => 300
+        "15"   => 900
+        "30"   => 1800
+        "60"   => 3600
+        "240"  => 14400
+        "1440" => 86400
+        => 900
+
+f_lbForTF(tfSeconds) =>
+    isD = tfSeconds >= 86400
+    l = isD ? 20 : tfSeconds >= 14400 ? 20 : tfSeconds >= 3600 ? 15 : tfSeconds >= 1800 ? 10 : tfSeconds >= 900 ? 8 : 5
+    r = isD ? 15 : tfSeconds >= 14400 ? 15 : tfSeconds >= 3600 ? 10 : tfSeconds >= 1800 ? 8  : tfSeconds >= 900 ? 6 : 4
+    [l, r]
+
+[valLbLeft, valLbRight] = f_lbForTF(valTfSeconds(valTF))
+
+// ══════════════════════════════════════════
+//  SECTION 8: SESSION DETECTION
+// ══════════════════════════════════════════
+inLondonSession = not na(time(timeframe.period, londonSession, "Europe/Paris"))
+inNYSession = not na(time(timeframe.period, nySession, "Europe/Paris"))
+sessionCode = (inLondonSession and inNYSession) ? 3.0 : inLondonSession ? 1.0 : inNYSession ? 2.0 : 0.0
+inAnySession = inLondonSession or inNYSession
+
+// ══════════════════════════════════════════
+//  SECTION 9: PIVOT DETECTION (MAIN CHART TF)
+// ══════════════════════════════════════════
+pLow  = ta.pivotlow(low, lbLeft, lbRight)
+pHigh = ta.pivothigh(high, lbLeft, lbRight)
+
+pLowVal  = ta.valuewhen(not na(pLow), low[lbRight], 0)
+pHighVal = ta.valuewhen(not na(pHigh), high[lbRight], 0)
+
+prevLowIndex  = ta.valuewhen(not na(pLow), bar_index[lbRight], 0)
+prevHighIndex = ta.valuewhen(not na(pHigh), bar_index[lbRight], 0)
+
+lp = ta.lowest(low, lbLeft)
+hp = ta.highest(high, lbLeft)
+highestClose = ta.highest(close, lbLeft)
+lowestClose = ta.lowest(close, lbLeft)
+
+// ══════════════════════════════════════════
+//  SECTION 10: SWING CONDITIONS (MAIN TF)
+// ══════════════════════════════════════════
+var int swingBullIdx = 0
+var int swingBearIdx = 0
+
+bullishSFP = low < pLowVal and close > pLowVal and open > pLowVal and low == lp and lowestClose >= pLowVal
+bearishSFP = high > pHighVal and close < pHighVal and open < pHighVal and high == hp and highestClose <= pHighVal
+
+newSwingLow = not na(pLow) and not bullishSFP[lbRight]
+newSwingHigh = not na(pHigh) and not bearishSFP[lbRight]
+
+swingBullCond = newSwingLow and bar_index >= swingBullIdx + cooldownPeriod
+swingBearCond = newSwingHigh and bar_index >= swingBearIdx + cooldownPeriod
+
+// ══════════════════════════════════════════
+//  SECTION 11: LTF VALIDATOR (M15/LTF auto)
+// ══════════════════════════════════════════
+getEntryValidation(direction) =>
+    valHigh = request.security(syminfo.tickerid, valTF, high[1])
+    valLow = request.security(syminfo.tickerid, valTF, low[1])
+    valClose = request.security(syminfo.tickerid, valTF, close[1])
+    valOpen = request.security(syminfo.tickerid, valTF, open[1])
+    valVolume = request.security(syminfo.tickerid, valTF, volume[1])
+    valVolumeSMA = request.security(syminfo.tickerid, valTF, ta.sma(volume, 20)[1])
+    
+    valPivotHighVal = request.security(syminfo.tickerid, valTF, ta.valuewhen(not na(ta.pivothigh(high, valLbLeft, valLbRight)), high[valLbRight], 0))
+    valPivotLowVal = request.security(syminfo.tickerid, valTF, ta.valuewhen(not na(ta.pivotlow(low, valLbLeft, valLbRight)), low[valLbRight], 0))
+    valPivotHighTime = request.security(syminfo.tickerid, valTF, ta.valuewhen(not na(ta.pivothigh(high, valLbLeft, valLbRight)), time[valLbRight], 0))
+    valPivotLowTime = request.security(syminfo.tickerid, valTF, ta.valuewhen(not na(ta.pivotlow(low, valLbLeft, valLbRight)), time[valLbRight], 0))
+    
+    valClose1 = request.security(syminfo.tickerid, valTF, close[2])
+    valOpen1 = request.security(syminfo.tickerid, valTF, open[2])
+    
+    valBody = math.abs(valClose - valOpen)
+    valRange = valHigh - valLow
+    valBodyRatio = valRange > 0 ? valBody / valRange : 0
+    
+    valBody1 = math.abs(valClose1 - valOpen1)
+    valRange1 = request.security(syminfo.tickerid, valTF, high[2] - low[2])
+    valBodyRatio1 = valRange1 > 0 ? valBody1 / valRange1 : 0
+    
+    freshWindowMs = valTfSeconds(valTF) * 1000 * ltfFreshPivotBars
+    
+    if direction > 0
+        prev_above_pivot = valClose1 > valPivotLowVal
+        curr_above_pivot = valClose > valPivotLowVal
+        vol_boost = valVolume > valVolumeSMA * m15VolumeThreshold
+        body_clear = valBodyRatio >= m15BodyThreshold and valBodyRatio1 >= m15BodyThreshold
+        pivot_fresh = not na(valPivotLowTime) and (time - valPivotLowTime) <= freshWindowMs
+        [prev_above_pivot, curr_above_pivot, vol_boost, body_clear, pivot_fresh]
+    else
+        prev_below_pivot = valClose1 < valPivotHighVal
+        curr_below_pivot = valClose < valPivotHighVal
+        vol_boost = valVolume > valVolumeSMA * m15VolumeThreshold
+        body_clear = valBodyRatio >= m15BodyThreshold and valBodyRatio1 >= m15BodyThreshold
+        pivot_fresh = not na(valPivotHighTime) and (time - valPivotHighTime) <= freshWindowMs
+        [prev_below_pivot, curr_below_pivot, vol_boost, body_clear, pivot_fresh]
+
+[val_prev_bull, val_curr_bull, val_vol_bull, val_body_bull, val_fresh_bull] = getEntryValidation(1.0)
+[val_prev_bear, val_curr_bear, val_vol_bear, val_body_bear, val_fresh_bear] = getEntryValidation(-1.0)
+
+// Verdict: N-1 ET N OBLIGATOIRES + 1 parmi Vol/Body (+ optionnel Pivot Fresh)
+countBull = (val_prev_bull ? 1 : 0) + (val_curr_bull ? 1 : 0) + (val_vol_bull ? 1 : 0) + (val_body_bull ? 1 : 0) + (useFreshPivot and val_fresh_bull ? 1 : 0)
+countBear = (val_prev_bear ? 1 : 0) + (val_curr_bear ? 1 : 0) + (val_vol_bear ? 1 : 0) + (val_body_bear ? 1 : 0) + (useFreshPivot and val_fresh_bear ? 1 : 0)
+
+val_valid_bull = val_prev_bull and val_curr_bull and (val_vol_bull or val_body_bull)
+val_valid_bear = val_prev_bear and val_curr_bear and (val_vol_bear or val_body_bear)
+
+// ══════════════════════════════════════════
+//  SECTION 12: FILTERS (RSI, EMA)
+// ══════════════════════════════════════════
+rsiVal = ta.rsi(close, rsiLen)
+ema21  = ta.ema(close, emaFast)
+ema50  = ta.ema(close, emaSlow)
+
+rsiOkBull = not useRsi or rsiVal > rsiMidBull
+rsiOkBear = not useRsi or rsiVal < rsiMidBear
+
+emaOkBull = not useEma or ema21 > ema50
+emaOkBear = not useEma or ema21 < ema50
+
+bullConfirm = rsiOkBull and emaOkBull
+bearConfirm = rsiOkBear and emaOkBear
+
+// ══════════════════════════════════════════
+//  SECTION 13: ALLYOUNEED-LIKE SIGNALS
+// ══════════════════════════════════════════
+// Mode A: Swing colors only
+// Mode B: Swing + Support/Resistance + Fibonacci
+// Mode C: Custom configuration
+
+aynSwingBull = newSwingLow and val_valid_bull
+aynSwingBear = newSwingHigh and val_valid_bear
+
+aynSupport = ta.lowest(low, aynSwingLookback)
+aynResistance = ta.highest(high, aynSwingLookback)
+
+aynBullSignal = false
+aynBearSignal = false
+
+if ayneMode == "Mode A: Swing Only"
+    aynBullSignal := aynSwingBull
+    aynBearSignal := aynSwingBear
+else if ayneMode == "Mode B: Swing+Sup/Res+Fibo"
+    // Bull: Swing LOW + price near support + validator OK
+    aynBullSignal := aynSwingBull and close <= aynSupport * 1.01
+    // Bear: Swing HIGH + price near resistance + validator OK
+    aynBearSignal := aynSwingBear and close >= aynResistance * 0.99
+else if ayneMode == "Mode C: Custom"
+    aynBullSignal := aynSwingBull
+    aynBearSignal := aynSwingBear
+
+// ══════════════════════════════════════════
+//  SECTION 14: ATR CALCULATIONS
+// ══════════════════════════════════════════
+atrVal = ta.atr(atrLen)
+
+calcATR(entryPx, isBull, isValidated) =>
+    atrUsed = atrVal
+    slMul = isValidated ? atrSlMulReduced : atrSlMul
+    slDist = atrUsed * slMul
+    slPx   = isBull ? entryPx - slDist : entryPx + slDist
+    tpPx   = isBull ? entryPx + slDist * atrTpRR : entryPx - slDist * atrTpRR
+    [slPx, tpPx]
+
+[sbSl, sbTp] = calcATR(pLowVal, true, val_valid_bull)
+[scSl, scTp] = calcATR(pHighVal, false, val_valid_bear)
+
+// ══════════════════════════════════════════
+//  SECTION 15: FINAL SIGNALS
+// ══════════════════════════════════════════
+sessionOk = not useSessionFilter or inAnySession
+
+swingBullFinal = swingBullCond and bullConfirm and val_valid_bull and sessionOk and aynBullSignal
+swingBearFinal = swingBearCond and bearConfirm and val_valid_bear and sessionOk and aynBearSignal
+
+// ══════════════════════════════════════════
+//  SECTION 16: SIGNAL TRACKING & DISPLAY
+// ══════════════════════════════════════════
+var array<float> tradeLog = array.new_float(0)
+var int statTotalSwing = 0
+var int statTpSwing = 0
+var int statSlSwing = 0
+
+var hourTotal = array.new_int(24, 0)
+var hourWin = array.new_int(24, 0)
+
+var sessTotal = array.new_int(4, 0)
+var sessWin = array.new_int(4, 0)
+
+if swingBullFinal
+    swingBullIdx := bar_index
+    statTotalSwing += 1
+    array.push(tradeLog, pLowVal)
+    array.push(tradeLog, sbTp)
+    array.push(tradeLog, sbSl)
+    array.push(tradeLog, 1.0)
+    array.push(tradeLog, float(bar_index))
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, float(hour(time, "Europe/Paris")))
+    array.push(tradeLog, sessionCode)
+
+if swingBearFinal
+    swingBearIdx := bar_index
+    statTotalSwing += 1
+    array.push(tradeLog, pHighVal)
+    array.push(tradeLog, scTp)
+    array.push(tradeLog, scSl)
+    array.push(tradeLog, -1.0)
+    array.push(tradeLog, float(bar_index))
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, float(hour(time, "Europe/Paris")))
+    array.push(tradeLog, sessionCode)
+
+int nTrades = array.size(tradeLog) / 9
+
+// Resolution tracking
+if nTrades > 0
+    for i = 0 to nTrades - 1
+        base = i * 9
+        tp_i = array.get(tradeLog, base + 1)
+        sl_i = array.get(tradeLog, base + 2)
+        dir_i = array.get(tradeLog, base + 3)
+        sigBar_i = array.get(tradeLog, base + 4)
+        resolved = array.get(tradeLog, base + 5)
+        hour_i = int(array.get(tradeLog, base + 7))
+        sess_i = int(array.get(tradeLog, base + 8))
+        
+        isBull_i = dir_i > 0
+        barsElapsed = bar_index - int(sigBar_i)
+        timeout = barsElapsed >= lookForward
+        
+        if resolved == 0.0
+            tpHit = (isBull_i and high >= tp_i) or (not isBull_i and low <= tp_i)
+            slHit = (isBull_i and low <= sl_i) or (not isBull_i and high >= sl_i)
+            
+            if slHit
+                array.set(tradeLog, base + 5, 1.0)
+                statSlSwing += 1
+                array.set(hourTotal, hour_i, array.get(hourTotal, hour_i) + 1)
+                array.set(sessTotal, int(sess_i), array.get(sessTotal, int(sess_i)) + 1)
+            else if tpHit
+                array.set(tradeLog, base + 5, 1.0)
+                statTpSwing += 1
+                array.set(hourTotal, hour_i, array.get(hourTotal, hour_i) + 1)
+                array.set(hourWin, hour_i, array.get(hourWin, hour_i) + 1)
+                array.set(sessTotal, int(sess_i), array.get(sessTotal, int(sess_i)) + 1)
+                array.set(sessWin, int(sess_i), array.get(sessWin, int(sess_i)) + 1)
+            else if timeout
+                array.set(tradeLog, base + 5, 1.0)
+                statSlSwing += 1
+                array.set(hourTotal, hour_i, array.get(hourTotal, hour_i) + 1)
+                array.set(sessTotal, int(sess_i), array.get(sessTotal, int(sess_i)) + 1)
+
+// ══════════════════════════════════════════
+//  SECTION 17: VISUAL SIGNALS (BUBBLES + CROSSES)
+// ══════════════════════════════════════════
+if swingBullFinal
+    // Bulle verte en bas + croix au prix
+    label.new(bar_index, pLowVal - atrVal * 0.5, text="Buy @" + priceStr(close), 
+              color=color.new(color.green, 0), style=label.style_label_up, textcolor=color.white, size=size.small)
+    line.new(bar_index - 1, close, bar_index + 1, close, color=color.green, width=2, style=line.style_solid)
+
+if swingBearFinal
+    // Bulle rouge en haut + croix au prix
+    label.new(bar_index, pHighVal + atrVal * 0.5, text="Sell @" + priceStr(close), 
+              color=color.new(color.red, 0), style=label.style_label_down, textcolor=color.white, size=size.small)
+    line.new(bar_index - 1, close, bar_index + 1, close, color=color.red, width=2, style=line.style_solid)
+
+// ══════════════════════════════════════════
+//  SECTION 18: CONFLUENCE TABLE
+// ══════════════════════════════════════════
+if showConfluenceTable
+    tblConf = table.new(tablePosition(confluenceTablePos), 2, 5, bgcolor=color.new(#1e222d, 80), border_color=color.gray)
+    
+    table.cell(tblConf, 0, 0, "CONFLUENCE CHECK", text_size=valTextSize(confluenceTableSize), text_color=color.white, bgcolor=color.new(#2d3748, 100))
+    
+    swingOk = swingBullFinal or swingBearFinal
+    table.cell(tblConf, 0, 1, "Swing", text_size=valTextSize(confluenceTableSize), text_color=color.white)
+    table.cell(tblConf, 1, 1, swingOk ? "✓" : "✗", text_size=valTextSize(confluenceTableSize), text_color=swingOk ? color.green : color.red)
+    
+    aynOk = aynBullSignal or aynBearSignal
+    table.cell(tblConf, 0, 2, "AllYouNeed", text_size=valTextSize(confluenceTableSize), text_color=color.white)
+    table.cell(tblConf, 1, 2, aynOk ? "✓" : "✗", text_size=valTextSize(confluenceTableSize), text_color=aynOk ? color.green : color.red)
+    
+    rsiOk = (swingBullFinal and rsiOkBull) or (swingBearFinal and rsiOkBear)
+    table.cell(tblConf, 0, 3, "RSI " + str.tostring(math.round(rsiVal, 1)), text_size=valTextSize(confluenceTableSize), text_color=color.white)
+    table.cell(tblConf, 1, 3, rsiOk ? "✓" : "✗", text_size=valTextSize(confluenceTableSize), text_color=rsiOk ? color.green : color.orange)
+    
+    valOk = val_valid_bull or val_valid_bear
+    table.cell(tblConf, 0, 4, "Validator LTF", text_size=valTextSize(confluenceTableSize), text_color=color.white)
+    table.cell(tblConf, 1, 4, valOk ? "✓" : "✗", text_size=valTextSize(confluenceTableSize), text_color=valOk ? color.green : color.red)
+
+// ══════════════════════════════════════════
+//  SECTION 19: VALIDATOR TABLE
+// ══════════════════════════════════════════
+if showValidator
+    tblVal = table.new(tablePosition(valTablePos), 2, 6, bgcolor=color.new(#1e222d, 80), border_color=color.gray)
+    
+    table.cell(tblVal, 0, 0, "VALIDATOR " + valTF, text_size=valTextSize(valTableSize), text_color=color.white, bgcolor=color.new(#2d3748, 100))
+    
+    isBull = swingBullFinal
+    isBear = swingBearFinal
+    
+    v1 = isBull ? val_prev_bull : val_prev_bear
+    v2 = isBull ? val_curr_bull : val_curr_bear
+    v3 = isBull ? val_vol_bull : val_vol_bear
+    v4 = isBull ? val_body_bull : val_body_bear
+    
+    table.cell(tblVal, 0, 1, "Bougie N-1", text_size=valTextSize(valTableSize), text_color=color.white)
+    table.cell(tblVal, 1, 1, v1 ? "✓" : "✗", text_size=valTextSize(valTableSize), text_color=v1 ? color.green : color.red)
+    
+    table.cell(tblVal, 0, 2, "Bougie N", text_size=valTextSize(valTableSize), text_color=color.white)
+    table.cell(tblVal, 1, 2, v2 ? "✓" : "✗", text_size=valTextSize(valTableSize), text_color=v2 ? color.green : color.red)
+    
+    table.cell(tblVal, 0, 3, "Vol Boost", text_size=valTextSize(valTableSize), text_color=color.white)
+    table.cell(tblVal, 1, 3, v3 ? "✓" : "✗", text_size=valTextSize(valTableSize), text_color=v3 ? color.green : color.orange)
+    
+    table.cell(tblVal, 0, 4, "Body Clear", text_size=valTextSize(valTableSize), text_color=color.white)
+    table.cell(tblVal, 1, 4, v4 ? "✓" : "✗", text_size=valTextSize(valTableSize), text_color=v4 ? color.green : color.orange)
+    
+    countDisplay = (isBull or isBear) ? (v1 ? 1 : 0) + (v2 ? 1 : 0) + (v3 ? 1 : 0) + (v4 ? 1 : 0) : 0
+    table.cell(tblVal, 0, 5, "Score", text_size=valTextSize(valTableSize), text_color=color.white, bgcolor=color.new(#2d3748, 100))
+    table.cell(tblVal, 1, 5, str.tostring(countDisplay) + "/4", text_size=valTextSize(valTableSize), text_color=countDisplay >= 3 ? color.green : color.orange, bgcolor=color.new(#2d3748, 100))
+
+// ══════════════════════════════════════════
+//  SECTION 20: STATS TABLE
+// ══════════════════════════════════════════
+if showTable
+    tblStats = table.new(tablePosition(tablePos), 2, 5, bgcolor=color.new(#1e222d, 80), border_color=color.gray)
+    
+    table.cell(tblStats, 0, 0, "📊 STATS", text_size=tableTxtSize, text_color=color.white, bgcolor=color.new(#2d3748, 100))
+    
+    wrSwing = statTotalSwing == 0 ? "—" : str.tostring(math.round(statTpSwing / statTotalSwing * 100, 1)) + "%"
+    table.cell(tblStats, 0, 1, "Swing WR", text_size=tableTxtSize, text_color=color.white)
+    table.cell(tblStats, 1, 1, wrSwing, text_size=tableTxtSize, text_color=statTpSwing >= statSlSwing ? color.green : color.red)
+    
+    table.cell(tblStats, 0, 2, "TP / SL", text_size=tableTxtSize, text_color=color.white)
+    table.cell(tblStats, 1, 2, str.tostring(statTpSwing) + " / " + str.tostring(statSlSwing), text_size=tableTxtSize, text_color=color.gray)
+    
+    table.cell(tblStats, 0, 3, "Total Trades", text_size=tableTxtSize, text_color=color.white)
+    table.cell(tblStats, 1, 3, str.tostring(statTotalSwing), text_size=tableTxtSize, text_color=color.gray)
+    
+    table.cell(tblStats, 0, 4, "ATR", text_size=tableTxtSize, text_color=color.white)
+    table.cell(tblStats, 1, 4, priceStr(atrVal), text_size=tableTxtSize, text_color=color.gray)
+
+// ══════════════════════════════════════════
+//  SECTION 21: LATE ENTRY HELPER
+// ══════════════════════════════════════════
+if showLateEntryHelper and (swingBullFinal or swingBearFinal)
+    isBull = swingBullFinal
+    tp = isBull ? sbTp : scTp
+    sl = isBull ? sbSl : scSl
+    
+    currentRR = isBull ? (tp - close) / math.max(close - sl, 0.00001) : (close - tp) / math.max(sl - close, 0.00001)
+    
+    if currentRR < lateEntryMinRR
+        adjustedSL = isBull ? close - (tp - close) / lateEntryMinRR : close + (tp - close) / lateEntryMinRR
+        minSL = isBull ? close - atrVal * lateEntryMinAtrFrac : close + atrVal * lateEntryMinAtrFrac
+        
+        if (isBull and adjustedSL < minSL) or (not isBull and adjustedSL > minSL)
+            tblLate = table.new(tablePosition(lateEntryTablePos), 2, 3, bgcolor=color.new(#1e222d, 80), border_color=color.orange)
+            table.cell(tblLate, 0, 0, "⏰ ENTRY TROP TARDIVE", text_size=valTextSize(lateEntryTableSize), text_color=color.white, bgcolor=color.new(#ff6b35, 80))
+            table.cell(tblLate, 0, 1, "RR Actuel", text_size=valTextSize(lateEntryTableSize), text_color=color.white)
+            table.cell(tblLate, 1, 1, str.tostring(math.round(currentRR, 2)) + " < " + str.tostring(lateEntryMinRR), text_size=valTextSize(lateEntryTableSize), text_color=color.orange)
+            table.cell(tblLate, 0, 2, "SL Suggéré", text_size=valTextSize(lateEntryTableSize), text_color=color.white)
+            table.cell(tblLate, 1, 2, priceStr(adjustedSL), text_size=valTextSize(lateEntryTableSize), text_color=color.yellow)
+        else
+            tblLate = table.new(tablePosition(lateEntryTablePos), 2, 2, bgcolor=color.new(#1e222d, 80), border_color=color.green)
+            table.cell(tblLate, 0, 0, "✓ ENTRÉE À TEMPS", text_size=valTextSize(lateEntryTableSize), text_color=color.white, bgcolor=color.new(#2d3748, 100))
+            table.cell(tblLate, 0, 1, "RR", text_size=valTextSize(lateEntryTableSize), text_color=color.white)
+            table.cell(tblLate, 1, 1, str.tostring(math.round(currentRR, 2)), text_size=valTextSize(lateEntryTableSize), text_color=color.green)
+
+// ══════════════════════════════════════════
+//  END OF INDICATOR
+// ══════════════════════════════════════════
