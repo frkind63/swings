@@ -1,0 +1,1820 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// Sweep & Swing — ATR V6 + VALIDATEUR ADAPTATIF (LTF auto)
+//
+// ══════════════════════════════════════════
+// NOUVEAUTÉS V6 (vs V5):
+// 1) Le validateur n'est plus fixé sur M15. Il s'adapte automatiquement
+//    au timeframe du graphique:
+//       Daily → validateur H4
+//       H4    → validateur H1
+//       H1    → validateur M15   (comme avant)
+//       M30   → validateur M5
+//    Mode manuel disponible si vous voulez forcer un TF précis.
+// 2) Le VERDICT du validateur exige maintenant les 4 conditions
+//    (N-1, N, Vol Boost, Body Clear) — plus de "GO" avec Vol/Body à NO.
+// 3) Tableau du validateur: taille (Compact/Normal/Grand/Très Grand)
+//    et position configurables.
+// ══════════════════════════════════════════
+
+//@version=6
+indicator('Sweep & Swing — ATR V6 + VALIDATEUR ADAPTATIF', overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=200)
+
+// ══════════════════════════════════════════
+//  INPUTS — PIVOT AUTO PAR TF (signal principal, sur le TF du graphique)
+// ══════════════════════════════════════════
+grp0 = "⚙️ Pivot — Auto par Timeframe"
+autoTf = input.bool(true, title="Pivot auto selon le TF actif?", group=grp0,
+         tooltip="Si activé, lbLeft et lbRight sont ajustés automatiquement selon le TF du graphique.")
+
+autoLbLeft  = timeframe.isdaily  ? 20 : timeframe.in_seconds() >= 14400 ? 20 : timeframe.in_seconds() >= 3600 ? 15 : timeframe.in_seconds() >= 1800 ? 10 : timeframe.in_seconds() >= 900 ? 8 : 5
+autoLbRight = timeframe.isdaily  ? 15 : timeframe.in_seconds() >= 14400 ? 15 : timeframe.in_seconds() >= 3600 ? 10 : timeframe.in_seconds() >= 1800 ? 8  : timeframe.in_seconds() >= 900 ? 6 : 4
+autoCooldown= timeframe.isdaily  ? 5  : timeframe.in_seconds() >= 14400 ? 5  : timeframe.in_seconds() >= 3600 ? 8  : timeframe.in_seconds() >= 1800 ? 10 : timeframe.in_seconds() >= 900 ? 12 : 15
+
+manLbLeft   = input.int(20, title="Pivot Left Bars (manuel)",  minval=1, group=grp0)
+manLbRight  = input.int(15, title="Pivot Right Bars (manuel)", minval=1, group=grp0)
+manCooldown = input.int(5,  title="Cooldown (manuel)",         minval=0, group=grp0)
+
+lbLeft  = autoTf ? autoLbLeft   : manLbLeft
+lbRight = autoTf ? autoLbRight  : manLbRight
+cooldownPeriod = autoTf ? autoCooldown : manCooldown
+
+// ══════════════════════════════════════════
+//  INPUTS — VALIDATEUR LTF ADAPTATIF (NOUVEAU V6)
+// ══════════════════════════════════════════
+grp_val_tf = "🎯 TF du Validateur"
+autoValidatorTf = input.bool(true, title="TF validateur automatique (1 cran en dessous du chart)?", group=grp_val_tf,
+                  tooltip="Daily→H4 | H4→H1 | H1→M15 | M30→M5. Décochez pour choisir manuellement ci-dessous.")
+manValidatorTf  = input.string("15", title="TF validateur (manuel)", options=["1","5","15","30","60","240"], group=grp_val_tf,
+                  tooltip="Utilisé seulement si l'auto est décoché.")
+
+// ══════════════════════════════════════════
+//  INPUTS — M15/LTF ENTRY VALIDATOR
+// ══════════════════════════════════════════
+grp_m15_val = "✅ ENTRY VALIDATOR (LTF)"
+showM15Validator = input.bool(true, title="Afficher validateur LTF?", group=grp_m15_val)
+m15ConfirmationLookback = input.int(2, title="Nb bougies confirmation LTF", minval=1, maxval=5, group=grp_m15_val,
+                          tooltip="Nombre de bougies à chercher pour validation (typiquement 2)")
+m15VolumeThreshold = input.float(1.2, title="Multiplicateur volume LTF", minval=0.5, maxval=3.0, step=0.1, group=grp_m15_val,
+                     tooltip="Volume doit être > SMA(20) × ce multiplicateur")
+m15BodyThreshold = input.float(0.4, title="Ratio corps bougie LTF", minval=0.1, maxval=0.9, step=0.05, group=grp_m15_val,
+                   tooltip="Corps doit représenter > X% de la bougie pour être 'clair'")
+ltfFreshPivotBars = input.int(4, title="Pivot LTF 'frais' si formé il y a moins de X bougies LTF", minval=1, maxval=20, group=grp_m15_val,
+                   tooltip="Vérifie qu'un pivot M15 indépendant s'est formé récemment (pas juste un vieux pivot réutilisé) — sert de filtre comparatif, pas de blocage du verdict.")
+ltfValidationMode = input.string("Souple (1/2)", title="Vol Boost + Body Clear", options=["Strict (2/2)", "Souple (1/2)"], group=grp_m15_val,
+                   tooltip="Strict = Vol Boost ET Body Clear exigés ensemble (très restrictif). Souple = un seul des deux suffit. Bougie -1/-2 restent toujours obligatoires dans les deux modes.")
+
+grp_val_table = "📐 Tableau Validateur"
+valTableSize = input.string("Normal", title="Taille du tableau", options=["Compact","Normal","Grand","Très Grand"], group=grp_val_table)
+valTablePos  = input.string("Haut droite", title="Position", options=["Haut droite","Haut gauche","Bas droite","Bas gauche","Milieu droite"], group=grp_val_table)
+
+// ══════════════════════════════════════════
+//  INPUTS — MULTI-TIMEFRAME VALIDATION
+// ══════════════════════════════════════════
+grp_mtf = "🌍 Multi-Timeframe"
+useMTF = input.bool(false, title="✅ Valider sur TF supérieure?", group=grp_mtf)
+mtfSelector = input.string("Auto", title="TF supérieure", 
+               options=["Auto", "30", "60", "240", "1440"], group=grp_mtf)
+mtfAtrUsed = input.bool(true, title="✅ Utiliser ATR de la TF supérieure?", group=grp_mtf)
+
+// ══════════════════════════════════════════
+//  INPUTS — RSI DIVERGENCE
+// ══════════════════════════════════════════
+grp_rsi_div = "📈 RSI Divergence"
+useRsiDiv = input.bool(false, title="✅ Activer RSI Divergence?", group=grp_rsi_div)
+rsiDivLen = input.int(14, title="Période RSI", minval=5, maxval=50, group=grp_rsi_div)
+rsiDivLookback = input.int(3, title="Lookback divergence", minval=2, maxval=20, group=grp_rsi_div)
+rsiDivThresh = input.float(45.0, title="Seuil RSI", minval=20, maxval=80, group=grp_rsi_div)
+
+// ══════════════════════════════════════════
+//  INPUTS — SIGNAUX
+// ══════════════════════════════════════════
+grp1 = "📐 Swing H/L"
+showSwingSignal = input.bool(true, title="Signaux Swing?", group=grp1)
+showSwingMarkers= input.bool(true, title="Marqueurs H/L?", group=grp1)
+swingClr        = input.color(color.new(#607D8B, 0), title="Couleur marqueurs", group=grp1)
+swingBullColor  = input.color(color.new(#00E5FF, 0), title="Swing Bull color", group=grp1)
+swingBearColor  = input.color(color.new(#FF4081, 0), title="Swing Bear color", group=grp1)
+
+grp2 = "⚡ Sweep"
+showSweepSignal = input.bool(true, title="Signaux Sweep?", group=grp2)
+sweepBullColor  = input.color(color.new(#76FF03, 0), title="Sweep Bull color", group=grp2)
+sweepBearColor  = input.color(color.new(#E91E63, 0), title="Sweep Bear color", group=grp2)
+sweepLineWidth  = input.int(1, title="Sweep line width", group=grp2)
+sweepLineStyle  = input.string('Dashed', title="Sweep line style",
+                  options=['Solid','Dotted','Dashed'], group=grp2)
+
+grp_sweep_lag = "⏱️ Réduction Lag Sweep"
+sweepConfDelay = input.int(1, title="Délai confirmation Sweep (barres)", minval=0, maxval=3, group=grp_sweep_lag)
+
+// ══════════════════════════════════════════
+//  INPUTS — ATR TP/SL
+// ══════════════════════════════════════════
+grp3 = "🎯 ATR — TP / SL"
+atrLen   = input.int(14, title="ATR période", minval=1, group=grp3)
+atrSlMul = input.float(1.5, title="SL = ATR × (standard)", minval=0.1, step=0.1, group=grp3)
+atrSlMulReduced = input.float(0.7, title="SL = ATR × (si validé)", minval=0.1, step=0.1, group=grp3)
+atrTpRR  = input.float(2.5, title="TP R:R", minval=0.1, step=0.1, group=grp3)
+slBufPct = input.float(10.0, title="SL buffer structurel (%)", minval=0.0, step=1.0, group=grp3)
+
+entryClr    = input.color(color.new(#FFEB3B, 0), title="Entry color", group=grp3)
+tpClr       = input.color(color.new(#4CAF50, 0), title="TP color", group=grp3)
+slClr       = input.color(color.new(#F44336, 0), title="SL color", group=grp3)
+showRRLbl   = input.bool(true, title="Afficher R:R?", group=grp3)
+showRiskBox = input.bool(true, title="Show risk box?", group=grp3)
+lblSize     = input.string(size.small, title="Label size", options=[size.tiny, size.small, size.normal], group=grp3)
+
+// ══════════════════════════════════════════
+//  INPUTS — FILTRES
+// ══════════════════════════════════════════
+grp4 = "🔍 Filtres"
+useEma    = input.bool(false, title="✅ EMA", inline="f1", group=grp4)
+emaFast   = input.int(21, title="rapide", inline="f1", group=grp4, minval=1)
+emaSlow   = input.int(50, title="lente", inline="f1", group=grp4, minval=1)
+useRsi    = input.bool(true, title="✅ RSI", inline="f2", group=grp4)
+rsiLen    = input.int(14, title="période", inline="f2", group=grp4, minval=1)
+rsiMid    = input.float(40, title="seuil", inline="f2", group=grp4, minval=1, maxval=99)
+useBody   = input.bool(false, title="✅ Corps bougie", inline="f3", group=grp4)
+bodyRatio = input.float(0.35, title="ratio", inline="f3", group=grp4, minval=0.05, step=0.05)
+useConfirm = useEma or useRsi or useBody
+
+// ══════════════════════════════════════════
+//  INPUTS — GRAPHIQUE
+// ══════════════════════════════════════════
+grp5 = "📈 Affichage"
+maxTrades   = input.int(10, title="Nb trades graphique", minval=1, maxval=50, group=grp5)
+extBars     = input.int(3, title="Extension lignes", minval=1, maxval=10, group=grp5)
+
+// ══════════════════════════════════════════
+//  INPUTS — ALERTES + TABLEAU
+// ══════════════════════════════════════════
+grp6 = "🔔 Alertes"
+enableAlerts = input.bool(true, title="Alertes?", group=grp6)
+
+grp7 = "📊 Tableau Stats"
+showTable    = input.bool(true, title="Afficher tableau stats?", group=grp7)
+tablePos     = input.string("Bas droite", title="Position",
+               options=["Haut droite","Haut gauche","Bas droite","Bas gauche","Milieu droite"], group=grp7)
+tableTxtSize = input.string(size.small, title="Taille texte",
+               options=[size.tiny, size.small, size.normal, size.large], group=grp7)
+lookForward  = input.int(50, title="Fenêtre résultat (barres)", minval=5, maxval=5000, group=grp7)
+
+// ══════════════════════════════════════════
+//  INPUTS — MONEY MANAGEMENT / LOT SIZE (NOUVEAU)
+//  ⚠️ Le lot calculé est une ESTIMATION basée sur une table de valeur
+//  de pip approximative. Vérifiez toujours contre la calculatrice de
+//  votre broker/prop firm (TradeLocker/MT5) avant d'exécuter en réel.
+// ══════════════════════════════════════════
+grp_mm = "💰 Money Management (Lot suggéré)"
+enableLotCalc = input.bool(true, title="Calculer le lot suggéré dans les alertes?", group=grp_mm)
+mmMode = input.string("Évaluation", title="Phase du compte", options=["Évaluation","Financé"], group=grp_mm,
+         tooltip="Change le % de risque par trade appliqué au calcul du lot.")
+accountBalance = input.float(25000, title="Balance du compte (devise du compte)", minval=1, group=grp_mm)
+accountCurrency = input.string("EUR", title="Devise du compte", options=["EUR","USD"], group=grp_mm)
+eurUsdManualRate = input.float(1.08, title="Taux EUR/USD actuel (si compte EUR)", minval=0.5, maxval=2, step=0.001, group=grp_mm,
+                   tooltip="Utilisé uniquement pour convertir le risque EUR→USD dans le calcul du lot. À mettre à jour de temps en temps.")
+riskPctEval = input.float(0.5, title="Risque % / trade — Évaluation", minval=0.05, maxval=5, step=0.05, group=grp_mm)
+riskPctFunded = input.float(0.3, title="Risque % / trade — Financé", minval=0.05, maxval=5, step=0.05, group=grp_mm)
+rewardCapFunded = input.float(1000, title="Reward Cap $ (compte financé, info seulement)", minval=1, group=grp_mm,
+                  tooltip="Ex: $1000 pour un $25K 1-Step. Sert à afficher une alerte visuelle si le TP dépasse 40% de ce cap (règle de consistency).")
+
+// ══════════════════════════════════════════
+//  INPUTS — WINRATE PAR HORAIRE (NOUVEAU)
+// ══════════════════════════════════════════
+grp_hourly = "🕐 Winrate par Horaire"
+showHourlyTable = input.bool(false, title="Afficher le tableau winrate par heure?", group=grp_hourly,
+                  tooltip="Heures en Europe/Paris. Se remplit au fil des trades résolus (TP/SL/timeout).")
+hourlyTablePos = input.string("Bas gauche", title="Position", options=["Haut droite","Haut gauche","Bas droite","Bas gauche","Milieu droite"], group=grp_hourly)
+hourlyTableSize = input.string("Normal", title="Taille du tableau", options=["Compact","Normal","Grand","Très Grand"], group=grp_hourly)
+hourlyMinSample = input.int(3, title="Nb min de trades pour afficher une heure", minval=1, group=grp_hourly,
+                  tooltip="Masque les heures avec trop peu de données pour être fiables.")
+
+// ══════════════════════════════════════════
+//  INPUTS — FILTRE SESSION LONDRES/NY (NOUVEAU)
+// ══════════════════════════════════════════
+grp_session = "🌍 Filtre Session Londres/NY"
+useSessionFilter = input.bool(false, title="Limiter les signaux aux sessions Londres/NY ?", group=grp_session,
+                   tooltip="Si activé, aucun signal ne se déclenche hors des fenêtres définies ci-dessous. Si désactivé, les signaux se déclenchent comme avant, mais le tableau winrate par session reste disponible pour comparer.")
+londonSession = input.session("0900-1730", title="Session Londres (Europe/Paris)", group=grp_session)
+nySession = input.session("1430-2200", title="Session New York (Europe/Paris)", group=grp_session)
+showSessionTable = input.bool(false, title="Afficher le tableau winrate par session ?", group=grp_session)
+sessionTablePos = input.string("Milieu droite", title="Position", options=["Haut droite","Haut gauche","Bas droite","Bas gauche","Milieu droite"], group=grp_session)
+sessionTableSize = input.string("Normal", title="Taille du tableau", options=["Compact","Normal","Grand","Très Grand"], group=grp_session)
+
+// ══════════════════════════════════════════
+//  INPUTS — RISQUE DÉJÀ ENGAGÉ (NOUVEAU)
+//  Pont manuel avec l'agent Risk Manager: renseignez ici le risque %
+//  déjà ouvert ailleurs, le script vous avertit si un nouveau signal
+//  ferait dépasser votre plafond cumulé de sécurité.
+// ══════════════════════════════════════════
+grp_openrisk = "⚠️ Risque Déjà Engagé"
+manualOpenRiskPct = input.float(0.0, title="Risque déjà ouvert ailleurs (%)", minval=0, maxval=10, step=0.05, group=grp_openrisk,
+                    tooltip="À mettre à jour manuellement selon vos trades déjà ouverts (ex: valeur affichée dans votre Risk Manager).")
+cumulRiskCapPctEval = input.float(1.0, title="Plafond risque cumulé — Évaluation (%)", minval=0.1, step=0.05, group=grp_openrisk)
+cumulRiskCapPctFunded = input.float(0.7, title="Plafond risque cumulé — Financé (%)", minval=0.1, step=0.05, group=grp_openrisk)
+
+// ══════════════════════════════════════════
+//  INPUTS — COMPARATIF SL SERRÉ (NOUVEAU, expérimental)
+//  Simule en parallèle un SL plus serré que le SL structurel, TP inchangé.
+//  Deux variantes:
+//    - "Mèche" = déclenché dès que le prix touche le niveau (comme un vrai
+//      ordre stop broker — c'est ce qui se passerait réellement en trading).
+//    - "Clôture" = déclenché seulement si la bougie CLÔTURE au-delà (ne
+//      correspond PAS à un ordre stop classique — suppose une surveillance
+//      manuelle en direct, pas exécutable tel quel avec un stop broker).
+// ══════════════════════════════════════════
+grp_slcompare = "🔬 Comparatif SL Serré (expérimental)"
+showSlCompare = input.bool(false, title="Afficher comparatif SL serré?", group=grp_slcompare)
+
+// ══════════════════════════════════════════
+//  INPUTS — TOLÉRANCE RETOUR PIVOT (NOUVEAU)
+//  Au lieu d'exiger un retour EXACT au niveau du pivot pour la ligne
+//  "WR Swing (retour pivot)", on accepte un retour jusqu'à X% de la
+//  distance du SL — proportionnel au risque de chaque trade, pas un
+//  chiffre fixe en pips qui ne s'adapterait pas à la volatilité.
+// ══════════════════════════════════════════
+grp_retrace = "🔄 Tolérance Retour Pivot"
+retraceTolerancePct = input.float(20.0, title="Marge de tolérance (% distance SL)", minval=0.0, maxval=100.0, step=5.0, group=grp_retrace,
+                      tooltip="0% = retour exact au pivot (strict, comme avant). 20% = le prix compte comme 'retourné' dès qu'il revient à 20% de la distance du SL depuis le pivot. Plus le % est haut, plus il est facile de compter un trade comme 'retourné'.")
+showRetraceLine = input.bool(true, title="Afficher la ligne du niveau de tolérance sur le graphique ?", group=grp_retrace)
+retraceLineColor = input.color(color.new(#FF9800, 0), title="Couleur ligne tolérance", group=grp_retrace)
+retraceLineBars = input.int(3, title="Longueur de la ligne (bougies)", minval=1, maxval=20, group=grp_retrace)
+
+atrSlMulTight = input.float(0.5, title="SL serré = ATR ×", minval=0.05, maxval=2.0, step=0.05, group=grp_slcompare,
+               tooltip="Distance réduite testée en parallèle. TP identique au signal original (donc R:R amélioré si le SL serré tient).")
+slCompareTablePos = input.string("Milieu droite", title="Position", options=["Haut droite","Haut gauche","Bas droite","Bas gauche","Milieu droite"], group=grp_slcompare)
+slCompareTableSize = input.string("Normal", title="Taille du tableau", options=["Compact","Normal","Grand","Très Grand"], group=grp_slcompare)
+
+// ══════════════════════════════════════════
+//  INPUTS — OPTIMISATION ENTRÉE RÉALISTE (NOUVEAU)
+//  Deux tests indépendants pour chercher si l'entrée réaliste (prix de
+//  confirmation) peut repasser au-dessus du seuil de rentabilité:
+//  1) Confirmer plus tôt (délai réduit) — entrée plus proche du pivot.
+//  2) RR cible plus faible — SL identique, TP plus proche.
+// ══════════════════════════════════════════
+grp_optim = "🔬 Optimisation Entrée Réaliste"
+showOptimTable = input.bool(false, title="Afficher tableau optimisation ?", group=grp_optim)
+earlyOffsetBars = input.int(3, title="Test — confirmer X bougies plus tôt", minval=1, maxval=15, group=grp_optim,
+                  tooltip="Simule une entrée au prix de clôture d'il y a X bougies (approximation d'une confirmation plus rapide).")
+altRR1 = input.float(1.5, title="Test — RR alternatif 1", minval=0.3, step=0.1, group=grp_optim)
+altRR2 = input.float(2.0, title="Test — RR alternatif 2", minval=0.3, step=0.1, group=grp_optim)
+optimTablePos = input.string("Bas gauche", title="Position", options=["Haut droite","Haut gauche","Bas droite","Bas gauche","Milieu droite"], group=grp_optim)
+optimTableSize = input.string("Normal", title="Taille du tableau", options=["Compact","Normal","Grand","Très Grand"], group=grp_optim)
+
+// ══════════════════════════════════════════
+//  INPUTS — PRÉ-ALERTE (confirmation rapide, NOUVEAU)
+//  Détecte un pivot H1 avec un délai de confirmation bien plus court que
+//  le signal standard, MAIS exige obligatoirement que le validateur LTF
+//  (Bougie -1/-2 + Vol/Body) soit GO pour compenser la détection plus
+//  précoce et donc plus bruitée. Calculé dans la MÊME exécution que le
+//  signal standard, sur les MÊMES bougies — comparaison propre, sans le
+//  biais de fenêtre glissante qui affecte les tests via changement de
+//  réglage + rechargement.
+// ══════════════════════════════════════════
+grp_prealert = "🚀 Pré-Alerte (confirmation rapide)"
+showPreAlert = input.bool(false, title="Activer la pré-alerte ?", group=grp_prealert)
+preAlertLbRight = input.int(4, title="Délai de confirmation (bougies, réduit)", minval=1, maxval=20, group=grp_prealert,
+                  tooltip="Nettement plus petit que le lbRight standard — détecte plus tôt, mais nécessite le validateur LTF en GO pour filtrer le bruit.")
+preAlertCooldownBars = input.int(5, title="Cooldown pré-alerte (bougies)", minval=0, group=grp_prealert)
+preAlertTablePos = input.string("Milieu droite", title="Position tableau comparatif", options=["Haut droite","Haut gauche","Bas droite","Bas gauche","Milieu droite"], group=grp_prealert)
+preAlertTableSize = input.string("Normal", title="Taille tableau", options=["Compact","Normal","Grand","Très Grand"], group=grp_prealert)
+
+// ══════════════════════════════════════════
+//  INPUTS — AIDE ENTRÉE TARDIVE (NOUVEAU)
+//  Si vous découvrez le signal en différé (prix déjà bougé, TP parfois déjà
+//  touché), ce module recalcule EN CONTINU un SL qui préserve votre R:R
+//  cible depuis le prix ACTUEL, par rapport au TP fixe déjà fixé par le
+//  signal — sans jamais attendre de retour de prix vers le SL original.
+// ══════════════════════════════════════════
+grp_late = "⏰ Aide Entrée Tardive"
+showLateEntryHelper = input.bool(false, title="Afficher l'aide entrée tardive ?", group=grp_late)
+lateEntryMinRR = input.float(2.5, title="R:R à préserver", minval=0.5, step=0.1, group=grp_late,
+                 tooltip="Le SL suggéré est recalculé pour garder ce ratio entre le prix actuel et le TP fixe du dernier signal.")
+lateEntryMinAtrFrac = input.float(0.3, title="SL minimum acceptable = ATR ×", minval=0.05, step=0.05, group=grp_late,
+                 tooltip="Si le SL recalculé serait plus serré que ce plancher, le signal est jugé trop tardif — évite un stop si proche qu'il serait touché par du simple bruit.")
+lateEntryTablePos = input.string("Haut gauche", title="Position", options=["Haut droite","Haut gauche","Bas droite","Bas gauche","Milieu droite"], group=grp_late)
+lateEntryTableSize = input.string("Normal", title="Taille du tableau", options=["Compact","Normal","Grand","Très Grand"], group=grp_late)
+
+// ══════════════════════════════════════════
+//  FONCTIONS UTILITAIRES
+// ══════════════════════════════════════════
+fLineStyle(s) =>
+    s == 'Solid' ? line.style_solid : s == 'Dotted' ? line.style_dotted : line.style_dashed
+
+priceStr(p) => str.tostring(math.round(p, 5))
+pct(n, d)   => d == 0 ? "—" : str.tostring(math.round(n / d * 100, 1)) + "%"
+
+// ══════════════════════════════════════════
+//  DÉTECTION SESSION LONDRES/NY
+// ══════════════════════════════════════════
+inLondonSession = not na(time(timeframe.period, londonSession, "Europe/Paris"))
+inNYSession = not na(time(timeframe.period, nySession, "Europe/Paris"))
+// Code numérique pour stockage dans tradeLog: 0=Hors session, 1=Londres, 2=New York, 3=Chevauchement
+sessionCode = (inLondonSession and inNYSession) ? 3.0 : inLondonSession ? 1.0 : inNYSession ? 2.0 : 0.0
+inAnySession = inLondonSession or inNYSession
+
+// ══════════════════════════════════════════
+//  RISQUE CUMULÉ DÉJÀ ENGAGÉ (pont avec Risk Manager)
+// ══════════════════════════════════════════
+currentRiskPctMM = mmMode == "Évaluation" ? riskPctEval : riskPctFunded
+currentCumulCapMM = mmMode == "Évaluation" ? cumulRiskCapPctEval : cumulRiskCapPctFunded
+projectedCumulRiskPct = manualOpenRiskPct + currentRiskPctMM
+cumulRiskBreach = projectedCumulRiskPct > currentCumulCapMM
+cumulRiskTxt = cumulRiskBreach ? " | ⚠️RISQUE CUMULÉ " + str.tostring(projectedCumulRiskPct, "#.##") + "%>" + str.tostring(currentCumulCapMM, "#.##") + "%" : ""
+
+// ══════════════════════════════════════════
+//  MONEY MANAGEMENT — Taille de pip / valeur de pip (approximatif)
+//  ⚠️ Ces valeurs sont des standards de marché génériques (lot = 1.00,
+//  soit 100 000 unités pour le forex). Elles NE reflètent PAS forcément
+//  exactement les spécifications de contrat de TradeLocker ou de votre
+//  broker MT5. Vérifiez toujours avant d'utiliser en argent réel.
+// ══════════════════════════════════════════
+f_pipSize(sym) =>
+    str.contains(sym, "JPY") ? 0.01 : (str.contains(sym, "XAU") or str.contains(sym, "XAG")) ? 0.01 : 0.0001
+
+f_pipValueUsdPerLot(sym) =>
+    // Valeur approximative d'un pip pour 1.00 lot standard, en USD
+    str.contains(sym, "JPY") ? 9.0 : str.contains(sym, "XAU") ? 10.0 : str.contains(sym, "XAG") ? 5.0 : 10.0
+
+// Calcule un lot suggéré à partir de l'entrée/SL et du risque configuré.
+// Retourne na si le calcul n'est pas fiable (distance SL nulle).
+f_calcLot(entryPx, slPx, sym) =>
+    riskPct = mmMode == "Évaluation" ? riskPctEval : riskPctFunded
+    riskAmountAcctCcy = accountBalance * riskPct / 100
+    riskAmountUSD = accountCurrency == "EUR" ? riskAmountAcctCcy * eurUsdManualRate : riskAmountAcctCcy
+    pipSz = f_pipSize(sym)
+    pipValUSD = f_pipValueUsdPerLot(sym)
+    slDistPips = math.abs(entryPx - slPx) / pipSz
+    rawLot = slDistPips > 0 ? riskAmountUSD / (slDistPips * pipValUSD) : na
+    math.round(rawLot * 100) / 100
+
+// Vérifie si le profit potentiel du TP dépasserait le plafond de consistency
+// (40% du Reward Cap) en mode Financé — pour avertissement visuel uniquement.
+f_tpExceedsCap(entryPx, tpPx, slPx, sym) =>
+    lot = f_calcLot(entryPx, slPx, sym)
+    pipSz = f_pipSize(sym)
+    pipValUSD = f_pipValueUsdPerLot(sym)
+    tpDistPips = math.abs(tpPx - entryPx) / pipSz
+    potentialProfitUSD = tpDistPips * pipValUSD * lot
+    capUSD = rewardCapFunded * 0.4
+    mmMode == "Financé" and not na(lot) and potentialProfitUSD > capUSD
+
+tablePosition(p) =>
+    switch p
+        "Haut droite"   => position.top_right
+        "Haut gauche"   => position.top_left
+        "Bas droite"    => position.bottom_right
+        "Bas gauche"    => position.bottom_left
+        "Milieu droite" => position.middle_right
+        => position.bottom_right
+
+valTextSize(s) =>
+    switch s
+        "Compact"     => size.tiny
+        "Normal"      => size.small
+        "Grand"       => size.normal
+        "Très Grand"  => size.large
+        => size.small
+
+tfLabel() =>
+    timeframe.isdaily ? "D1" : timeframe.in_seconds() >= 14400 ? "H4" : timeframe.in_seconds() >= 3600 ? "H1" : timeframe.in_seconds() >= 1800 ? "M30" : timeframe.in_seconds() >= 900 ? "M15" : "M5"
+
+// Convertit un code TF request.security ("1","5","15","30","60","240","1440") en libellé lisible
+tfLabelFor(tfStr) =>
+    switch tfStr
+        "1"    => "M1"
+        "5"    => "M5"
+        "15"   => "M15"
+        "30"   => "M30"
+        "60"   => "H1"
+        "240"  => "H4"
+        "1440" => "D1"
+        => tfStr
+
+// Détermine le TF du validateur (1 cran en dessous du chart) en mode auto
+getAutoValidatorTf() =>
+    if timeframe.isdaily
+        "240"   // Daily → validateur H4
+    else if timeframe.in_seconds() >= 14400
+        "60"    // H4 → validateur H1
+    else if timeframe.in_seconds() >= 3600
+        "15"    // H1 → validateur M15
+    else if timeframe.in_seconds() >= 1800
+        "5"     // M30 → validateur M5
+    else if timeframe.in_seconds() >= 900
+        "5"     // M15 → validateur M5
+    else
+        "1"     // M5 ou moins → validateur M1
+
+valTF = autoValidatorTf ? getAutoValidatorTf() : manValidatorTf
+
+// Convertit un code TF en secondes pour calculer un lookback pivot adapté
+valTfSeconds(tfStr) =>
+    switch tfStr
+        "1"    => 60
+        "5"    => 300
+        "15"   => 900
+        "30"   => 1800
+        "60"   => 3600
+        "240"  => 14400
+        "1440" => 86400
+        => 900
+
+// Lookback pivot adapté à N'IMPORTE QUEL TF (utilisé pour le validateur LTF)
+f_lbForTF(tfSeconds) =>
+    isD = tfSeconds >= 86400
+    l = isD ? 20 : tfSeconds >= 14400 ? 20 : tfSeconds >= 3600 ? 15 : tfSeconds >= 1800 ? 10 : tfSeconds >= 900 ? 8 : 5
+    r = isD ? 15 : tfSeconds >= 14400 ? 15 : tfSeconds >= 3600 ? 10 : tfSeconds >= 1800 ? 8  : tfSeconds >= 900 ? 6 : 4
+    [l, r]
+
+[valLbLeft, valLbRight] = f_lbForTF(valTfSeconds(valTF))
+
+getMTFPeriod() =>
+    if mtfSelector != "Auto"
+        mtfSelector
+    else
+        if timeframe.isdaily
+            "1440"
+        else if timeframe.in_seconds() >= 14400
+            "1440"
+        else if timeframe.in_seconds() >= 3600
+            "240"
+        else if timeframe.in_seconds() >= 1800
+            "60"
+        else if timeframe.in_seconds() >= 900
+            "60"
+        else
+            "60"
+
+// Dessine un trade
+drawTrade(entryPx, slPx, tpPx, isBull, sigBar, sigClr, lineArr, labelArr, boxArr) =>
+    x1  = sigBar - extBars
+    x2  = sigBar + extBars
+    rrV = math.round(math.abs(tpPx - entryPx) / math.max(math.abs(entryPx - slPx), 0.00001), 1)
+    rrTxt = showRRLbl ? " R:R 1:" + str.tostring(rrV) : ""
+
+    array.push(lineArr, line.new(x1, entryPx, x2, entryPx, color=entryClr, width=2))
+    array.push(lineArr, line.new(x1, slPx, x2, slPx, color=slClr, width=1, style=line.style_dashed))
+    array.push(lineArr, line.new(x1, tpPx, x2, tpPx, color=tpClr, width=2, style=line.style_dashed))
+
+    array.push(labelArr, label.new(x2, entryPx, text="E " + priceStr(entryPx),
+               color=color.new(entryClr,15), textcolor=color.black, style=label.style_label_left, size=lblSize))
+    array.push(labelArr, label.new(x2, slPx, text="SL " + priceStr(slPx),
+               color=color.new(slClr,15), textcolor=color.white, style=label.style_label_left, size=lblSize))
+    array.push(labelArr, label.new(x2, tpPx, text="TP " + priceStr(tpPx) + rrTxt,
+               color=color.new(tpClr,15), textcolor=color.white, style=label.style_label_left, size=lblSize))
+
+    if showRiskBox
+        topBox = isBull ? entryPx : slPx
+        botBox = isBull ? slPx : entryPx
+        array.push(boxArr, box.new(x1, topBox, x2, botBox, border_color=color.new(sigClr, 50), bgcolor=color.new(sigClr, 88)))
+
+// ══════════════════════════════════════════
+//  DÉTECTION RSI DIVERGENCE
+// ══════════════════════════════════════════
+f_rsiDivergenceBull() =>
+    rsi = ta.rsi(close, rsiDivLen)
+    priceLow1 = ta.lowest(low, rsiDivLookback)
+    priceLow2 = ta.lowest(low[rsiDivLookback], rsiDivLookback)
+    rsiLow1 = ta.lowest(rsi, rsiDivLookback)
+    rsiLow2 = ta.lowest(rsi[rsiDivLookback], rsiDivLookback)
+    (priceLow1 > priceLow2) and (rsiLow1 < rsiLow2) and (rsi > rsiDivThresh)
+
+f_rsiDivergenceBear() =>
+    rsi = ta.rsi(close, rsiDivLen)
+    priceHi1 = ta.highest(high, rsiDivLookback)
+    priceHi2 = ta.highest(high[rsiDivLookback], rsiDivLookback)
+    rsiHi1 = ta.highest(rsi, rsiDivLookback)
+    rsiHi2 = ta.highest(rsi[rsiDivLookback], rsiDivLookback)
+    (priceHi1 > priceHi2) and (rsiHi1 < rsiHi2) and (rsi < (100 - rsiDivThresh))
+
+// ══════════════════════════════════════════
+//  VALIDATION LTF ADAPTATIVE (Daily→H4, H4→H1, H1→M15, ...)
+//  NOTE: Vol Boost et Body Clear décrivent la qualité de la bougie LTF
+//  elle-même (volume, taille du corps). Ce ne sont PAS des critères
+//  directionnels: ils sont donc identiques pour bull et bear, ce qui
+//  est un comportement normal. Seuls le pivot utilisé (PivotLow vs
+//  PivotHigh) et le sens des comparaisons de clôture diffèrent selon
+//  la direction.
+// ══════════════════════════════════════════
+getEntryValidation(direction) =>
+    // FIX ANTI-FLICKER: on ne travaille QUE sur des bougies LTF déjà
+    // clôturées ([1] = dernière clôturée, [2] = avant-dernière).
+    // Plus aucune valeur "en cours de formation" n'entre dans le calcul,
+    // donc le verdict ne peut plus changer entre deux clôtures LTF —
+    // il se met à jour une seule fois, proprement, à chaque clôture.
+    valHigh = request.security(syminfo.tickerid, valTF, high[1])
+    valLow = request.security(syminfo.tickerid, valTF, low[1])
+    valClose = request.security(syminfo.tickerid, valTF, close[1])
+    valOpen = request.security(syminfo.tickerid, valTF, open[1])
+    valVolume = request.security(syminfo.tickerid, valTF, volume[1])
+    valVolumeSMA = request.security(syminfo.tickerid, valTF, ta.sma(volume, 20)[1])
+    
+    // Pivot local LTF (lookback adapté au TF du validateur)
+    valPivotHighVal = request.security(syminfo.tickerid, valTF, ta.valuewhen(not na(ta.pivothigh(high, valLbLeft, valLbRight)), high[valLbRight], 0))
+    valPivotLowVal = request.security(syminfo.tickerid, valTF, ta.valuewhen(not na(ta.pivotlow(low, valLbLeft, valLbRight)), low[valLbRight], 0))
+    // Heure de confirmation du dernier pivot LTF — sert à juger s'il est "frais"
+    // (formé récemment, preuve indépendante) ou "vieux" (réutilisé depuis longtemps).
+    valPivotHighTime = request.security(syminfo.tickerid, valTF, ta.valuewhen(not na(ta.pivothigh(high, valLbLeft, valLbRight)), time[valLbRight], 0))
+    valPivotLowTime = request.security(syminfo.tickerid, valTF, ta.valuewhen(not na(ta.pivotlow(low, valLbLeft, valLbRight)), time[valLbRight], 0))
+    
+    // Bougie encore avant (avant-dernière clôturée)
+    valClose1 = request.security(syminfo.tickerid, valTF, close[2])
+    valOpen1 = request.security(syminfo.tickerid, valTF, open[2])
+    
+    // Calculs
+    valBody = math.abs(valClose - valOpen)
+    valRange = valHigh - valLow
+    valBodyRatio = valRange > 0 ? valBody / valRange : 0
+    
+    valBody1 = math.abs(valClose1 - valOpen1)
+    valRange1 = request.security(syminfo.tickerid, valTF, high[2] - low[2])
+    valBodyRatio1 = valRange1 > 0 ? valBody1 / valRange1 : 0
+    
+    // Détection confirmations
+    freshWindowMs = valTfSeconds(valTF) * 1000 * ltfFreshPivotBars
+    if direction > 0  // BULL
+        prev_above_pivot = valClose1 > valPivotLowVal
+        curr_above_pivot = valClose > valPivotLowVal
+        vol_boost = valVolume > valVolumeSMA * m15VolumeThreshold
+        body_clear = valBodyRatio >= m15BodyThreshold and valBodyRatio1 >= m15BodyThreshold
+        pivot_fresh = not na(valPivotLowTime) and (time - valPivotLowTime) <= freshWindowMs
+        [prev_above_pivot, curr_above_pivot, vol_boost, body_clear, valPivotLowVal, valClose, valVolume, valVolumeSMA, pivot_fresh]
+    else  // BEAR
+        prev_below_pivot = valClose1 < valPivotHighVal
+        curr_below_pivot = valClose < valPivotHighVal
+        vol_boost = valVolume > valVolumeSMA * m15VolumeThreshold
+        body_clear = valBodyRatio >= m15BodyThreshold and valBodyRatio1 >= m15BodyThreshold
+        pivot_fresh = not na(valPivotHighTime) and (time - valPivotHighTime) <= freshWindowMs
+        [prev_below_pivot, curr_below_pivot, vol_boost, body_clear, valPivotHighVal, valClose, valVolume, valVolumeSMA, pivot_fresh]
+
+// ══════════════════════════════════════════
+//  PIVOTS (TF principal du graphique)
+// ══════════════════════════════════════════
+pLow  = ta.pivotlow(low, lbLeft, lbRight)
+pHigh = ta.pivothigh(high, lbLeft, lbRight)
+
+pLowVal  = ta.valuewhen(not na(pLow), low[lbRight], 0)
+pHighVal = ta.valuewhen(not na(pHigh), high[lbRight], 0)
+
+prevLowIndex  = ta.valuewhen(not na(pLow), bar_index[lbRight], 0)
+prevHighIndex = ta.valuewhen(not na(pHigh), bar_index[lbRight], 0)
+
+lp = ta.lowest(low, lbLeft)
+hp = ta.highest(high, lbLeft)
+highestClose = ta.highest(close, lbLeft)
+lowestClose = ta.lowest(close, lbLeft)
+
+// ══════════════════════════════════════════
+//  PIVOTS MTF
+// ══════════════════════════════════════════
+mtfPeriod = getMTFPeriod()
+
+[mtf_pHigh, mtf_pLow] = request.security(syminfo.tickerid, mtfPeriod,
+    [ta.pivothigh(high, lbLeft, lbRight), ta.pivotlow(low, lbLeft, lbRight)])
+
+mtfBullConfirm = not useMTF or not na(mtf_pLow)
+mtfBearConfirm = not useMTF or not na(mtf_pHigh)
+
+// ══════════════════════════════════════════
+//  ATR
+// ══════════════════════════════════════════
+atrVal = ta.atr(atrLen)
+atrValMTF = mtfAtrUsed ? request.security(syminfo.tickerid, mtfPeriod, ta.atr(atrLen)) : atrVal
+
+// ══════════════════════════════════════════
+//  SWEEP CONDITIONS
+// ══════════════════════════════════════════
+bullishSFP = low < pLowVal and close > pLowVal and open > pLowVal and low == lp and lowestClose >= pLowVal
+bearishSFP = high > pHighVal and close < pHighVal and open < pHighVal and high == hp and highestClose <= pHighVal
+
+var int bullSweepIdx = 0
+var int bearSweepIdx = 0
+
+bullSweep = bullishSFP[sweepConfDelay] and close > pLowVal and close[1] > pLowVal[1] and close[2] > pLowVal[2] and bar_index >= bullSweepIdx + cooldownPeriod
+bearSweep = bearishSFP[sweepConfDelay] and close < pHighVal and close[1] < pHighVal[1] and close[2] < pHighVal[2] and bar_index >= bearSweepIdx + cooldownPeriod
+
+// ══════════════════════════════════════════
+//  SWING CONDITIONS
+// ══════════════════════════════════════════
+var int swingBullIdx = 0
+var int swingBearIdx = 0
+
+newSwingLow = not na(pLow) and not bullishSFP[lbRight]
+newSwingHigh = not na(pHigh) and not bearishSFP[lbRight]
+
+swingBullCond = showSwingSignal and newSwingLow and bar_index >= swingBullIdx + cooldownPeriod
+swingBearCond = showSwingSignal and newSwingHigh and bar_index >= swingBearIdx + cooldownPeriod
+
+// ══════════════════════════════════════════
+//  PIVOT RAPIDE (PRÉ-ALERTE) — même lbLeft (rigueur du côté gauche
+//  inchangée), mais lbRight bien plus court → confirmation plus précoce.
+//  Le bruit supplémentaire est censé être filtré par l'exigence du
+//  validateur LTF en GO (appliquée plus bas dans preAlertBullFinal).
+// ══════════════════════════════════════════
+fastPLow  = ta.pivotlow(low, lbLeft, preAlertLbRight)
+fastPHigh = ta.pivothigh(high, lbLeft, preAlertLbRight)
+fastPLowVal  = ta.valuewhen(not na(fastPLow), low[preAlertLbRight], 0)
+fastPHighVal = ta.valuewhen(not na(fastPHigh), high[preAlertLbRight], 0)
+
+var int preAlertBullIdx = 0
+var int preAlertBearIdx = 0
+
+newFastSwingLow  = not na(fastPLow)
+newFastSwingHigh = not na(fastPHigh)
+
+// ══════════════════════════════════════════
+//  FILTRES
+// ══════════════════════════════════════════
+ema21  = ta.ema(close, emaFast)
+ema50  = ta.ema(close, emaSlow)
+rsiVal = ta.rsi(close, rsiLen)
+
+candleBody = math.abs(close - open)
+candleRange = high - low
+bodyOk = candleRange > 0 and (candleBody / candleRange) >= bodyRatio
+
+emaOkBull = not useEma or ema21 > ema50
+emaOkBear = not useEma or ema21 < ema50
+rsiOkBull = not useRsi or rsiVal > rsiMid
+rsiOkBear = not useRsi or rsiVal < rsiMid
+bodyOkBull = not useBody or (bodyOk and close > open)
+bodyOkBear = not useBody or (bodyOk and close < open)
+
+bullConfirm = emaOkBull and rsiOkBull and bodyOkBull
+bearConfirm = emaOkBear and rsiOkBear and bodyOkBear
+
+rsiDivBull = useRsiDiv ? f_rsiDivergenceBull() : true
+rsiDivBear = useRsiDiv ? f_rsiDivergenceBear() : true
+
+// ══════════════════════════════════════════
+//  VALIDATION LTF (Récupération)
+// ══════════════════════════════════════════
+[val_prev_confirm_bull, val_curr_confirm_bull, val_vol_bull, val_body_bull, val_pivot_bull, val_close_bull, val_vol_bull_val, val_vol_sma_bull, val_pivot_fresh_bull] = getEntryValidation(1.0)
+[val_prev_confirm_bear, val_curr_confirm_bear, val_vol_bear, val_body_bear, val_pivot_bear, val_close_bear, val_vol_bear_val, val_vol_sma_bear, val_pivot_fresh_bear] = getEntryValidation(-1.0)
+
+// Verdict = les 4 conditions (N-1, N, Vol Boost, Body Clear)
+// Bougie -1/-2 toujours obligatoires. Vol Boost + Body Clear: ET (strict) ou OU (souple) selon le réglage.
+volBodyBull = ltfValidationMode == "Strict (2/2)" ? (val_vol_bull and val_body_bull) : (val_vol_bull or val_body_bull)
+volBodyBear = ltfValidationMode == "Strict (2/2)" ? (val_vol_bear and val_body_bear) : (val_vol_bear or val_body_bear)
+val_valid_bull = val_prev_confirm_bull and val_curr_confirm_bull and volBodyBull
+val_valid_bear = val_prev_confirm_bear and val_curr_confirm_bear and volBodyBear
+
+// ══════════════════════════════════════════
+//  SIGNAUX FINAUX
+// ══════════════════════════════════════════
+swingBullFinal = swingBullCond and (not useConfirm or bullConfirm) and mtfBullConfirm and rsiDivBull and (not useSessionFilter or inAnySession)
+swingBearFinal = swingBearCond and (not useConfirm or bearConfirm) and mtfBearConfirm and rsiDivBear and (not useSessionFilter or inAnySession)
+sweepBullFinal = showSweepSignal and bullSweep and (not useConfirm or bullConfirm) and mtfBullConfirm and rsiDivBull and (not useSessionFilter or inAnySession)
+sweepBearFinal = showSweepSignal and bearSweep and (not useConfirm or bearConfirm) and mtfBearConfirm and rsiDivBear and (not useSessionFilter or inAnySession)
+
+// Pré-alerte : confirmation plus rapide (preAlertLbRight), MAIS validateur
+// LTF obligatoirement GO (val_valid_bull/bear) pour compenser le bruit
+// supplémentaire d'une confirmation plus précoce.
+preAlertBullFinal = showPreAlert and newFastSwingLow and val_valid_bull and (not useConfirm or bullConfirm) and mtfBullConfirm and rsiDivBull and (not useSessionFilter or inAnySession) and bar_index >= preAlertBullIdx + preAlertCooldownBars
+preAlertBearFinal = showPreAlert and newFastSwingHigh and val_valid_bear and (not useConfirm or bearConfirm) and mtfBearConfirm and rsiDivBear and (not useSessionFilter or inAnySession) and bar_index >= preAlertBearIdx + preAlertCooldownBars
+
+// ══════════════════════════════════════════
+//  CALCUL ATR TP/SL
+// ══════════════════════════════════════════
+calcATR(entryPx, isBull, isMTFValidated, isRSIDivValidated) =>
+    atrUsed = mtfAtrUsed ? atrValMTF : atrVal
+    slMul = (isMTFValidated and isRSIDivValidated) ? atrSlMulReduced : atrSlMul
+    slDist = atrUsed * slMul
+    slPx   = isBull ? entryPx - slDist : entryPx + slDist
+    tpPx   = isBull ? entryPx + slDist * atrTpRR : entryPx - slDist * atrTpRR
+    [slPx, tpPx]
+
+[sbSl, sbTp] = calcATR(pLowVal, true, mtfBullConfirm, rsiDivBull)
+[scSl, scTp] = calcATR(pHighVal, false, mtfBearConfirm, rsiDivBear)
+[swbSl, swbTp] = calcATR(pLowVal, true, mtfBullConfirm, rsiDivBull)
+[swcSl, swcTp] = calcATR(pHighVal, false, mtfBearConfirm, rsiDivBear)
+
+// SL serré (comparatif) — même ATR de référence, multiplicateur réduit, TP inchangé
+f_tightSl(entryPx, isBull) =>
+    atrUsed = mtfAtrUsed ? atrValMTF : atrVal
+    tightDist = atrUsed * atrSlMulTight
+    isBull ? entryPx - tightDist : entryPx + tightDist
+
+sbSlTight  = f_tightSl(pLowVal, true)
+scSlTight  = f_tightSl(pHighVal, false)
+swbSlTight = f_tightSl(pLowVal, true)
+swcSlTight = f_tightSl(pHighVal, false)
+
+// ══════════════════════════════════════════
+//  ENTRÉE RÉALISTE (comparatif) — le backtest standard utilise le prix du
+//  PIVOT (pLowVal/pHighVal), qui n'est confirmé que lbRight bougies plus
+//  tard — vous ne pouvez JAMAIS entrer à ce prix en réel. Cette variante
+//  simule une entrée au prix de CLÔTURE de la bougie de confirmation
+//  (celle que vous voyez réellement au moment de l'alerte), avec un
+//  SL/TP recalculé depuis ce prix réel, même méthode ATR/RR que d'habitude.
+// ══════════════════════════════════════════
+f_realisticSlTp(entryPx, isBull, isMTFValidated, isRSIDivValidated) =>
+    atrUsed = mtfAtrUsed ? atrValMTF : atrVal
+    slMul = (isMTFValidated and isRSIDivValidated) ? atrSlMulReduced : atrSlMul
+    slDist = atrUsed * slMul
+    slPx   = isBull ? entryPx - slDist : entryPx + slDist
+    tpPx   = isBull ? entryPx + slDist * atrTpRR : entryPx - slDist * atrTpRR
+    [slPx, tpPx]
+
+// ══════════════════════════════════════════
+//  STATISTIQUES
+// ══════════════════════════════════════════
+var tradeLog = array.new_float(0)
+var int statTotalSwing = 0
+var int statTpSwing = 0
+var int statSlSwing = 0
+var int statTotalSweep = 0
+var int statTpSweep = 0
+var int statSlSweep = 0
+var int statResolutionTimeSum = 0
+var int statResolutionCount = 0
+
+// Suivi winrate par heure (Europe/Paris) — 24 compteurs
+var hourTotal = array.new_int(24, 0)
+var hourWin = array.new_int(24, 0)
+
+// Suivi winrate par session — 4 catégories: 0=Hors session, 1=Londres, 2=New York, 3=Chevauchement
+var sessTotal = array.new_int(4, 0)
+var sessWin = array.new_int(4, 0)
+
+// Comparatif SL serré (mèche vs clôture)
+var int statTpTight = 0
+var int statSlTight = 0
+var int statTpClose = 0
+var int statSlClose = 0
+
+// Comparatif Pivot LTF frais (filtre expérimental, informatif)
+var int statTpFreshPivot = 0
+var int statSlFreshPivot = 0
+
+// Comparatif Entrée Réaliste (prix de confirmation, pas le pivot théorique)
+var int statTpRealistic = 0
+var int statSlRealistic = 0
+
+// Optimisation Entrée Réaliste : confirmation anticipée + RR alternatifs
+var int statTpEarly = 0
+var int statSlEarly = 0
+var int statTpRR1 = 0
+var int statSlRR1 = 0
+var int statTpRR2 = 0
+var int statSlRR2 = 0
+
+// Comparatif "retour vers le pivot avant TP" — swing uniquement
+var int statTpRetrace = 0
+var int statSlRetrace = 0
+
+if swingBullFinal
+    swingBullIdx := bar_index
+    statTotalSwing += 1
+    array.push(tradeLog, pLowVal)
+    array.push(tradeLog, sbTp)
+    array.push(tradeLog, sbSl)
+    array.push(tradeLog, 1.0)
+    array.push(tradeLog, float(bar_index))
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, float(hour(time, "Europe/Paris")))
+    array.push(tradeLog, sessionCode)
+    array.push(tradeLog, sbSlTight)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, val_pivot_fresh_bull ? 1.0 : 0.0)
+    [realSlB1, realTpB1] = f_realisticSlTp(close, true, mtfBullConfirm, rsiDivBull)
+    array.push(tradeLog, close)
+    array.push(tradeLog, realSlB1)
+    array.push(tradeLog, realTpB1)
+    array.push(tradeLog, 0.0)
+    entryEarlyB1 = close[earlyOffsetBars]
+    [slEarlyB1, tpEarlyB1] = f_realisticSlTp(entryEarlyB1, true, mtfBullConfirm, rsiDivBull)
+    array.push(tradeLog, entryEarlyB1)
+    array.push(tradeLog, slEarlyB1)
+    array.push(tradeLog, tpEarlyB1)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+
+if swingBearFinal
+    swingBearIdx := bar_index
+    statTotalSwing += 1
+    array.push(tradeLog, pHighVal)
+    array.push(tradeLog, scTp)
+    array.push(tradeLog, scSl)
+    array.push(tradeLog, -1.0)
+    array.push(tradeLog, float(bar_index))
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, float(hour(time, "Europe/Paris")))
+    array.push(tradeLog, sessionCode)
+    array.push(tradeLog, scSlTight)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, val_pivot_fresh_bear ? 1.0 : 0.0)
+    [realSlB2, realTpB2] = f_realisticSlTp(close, false, mtfBearConfirm, rsiDivBear)
+    array.push(tradeLog, close)
+    array.push(tradeLog, realSlB2)
+    array.push(tradeLog, realTpB2)
+    array.push(tradeLog, 0.0)
+    entryEarlyB2 = close[earlyOffsetBars]
+    [slEarlyB2, tpEarlyB2] = f_realisticSlTp(entryEarlyB2, false, mtfBearConfirm, rsiDivBear)
+    array.push(tradeLog, entryEarlyB2)
+    array.push(tradeLog, slEarlyB2)
+    array.push(tradeLog, tpEarlyB2)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+
+if sweepBullFinal
+    bullSweepIdx := bar_index
+    statTotalSweep += 1
+    array.push(tradeLog, pLowVal)
+    array.push(tradeLog, swbTp)
+    array.push(tradeLog, swbSl)
+    array.push(tradeLog, 1.0)
+    array.push(tradeLog, float(bar_index - sweepConfDelay))
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 1.0)
+    array.push(tradeLog, float(hour(time, "Europe/Paris")))
+    array.push(tradeLog, sessionCode)
+    array.push(tradeLog, swbSlTight)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, val_pivot_fresh_bull ? 1.0 : 0.0)
+    [realSlB3, realTpB3] = f_realisticSlTp(close, true, mtfBullConfirm, rsiDivBull)
+    array.push(tradeLog, close)
+    array.push(tradeLog, realSlB3)
+    array.push(tradeLog, realTpB3)
+    array.push(tradeLog, 0.0)
+    entryEarlyB3 = close[earlyOffsetBars]
+    [slEarlyB3, tpEarlyB3] = f_realisticSlTp(entryEarlyB3, true, mtfBullConfirm, rsiDivBull)
+    array.push(tradeLog, entryEarlyB3)
+    array.push(tradeLog, slEarlyB3)
+    array.push(tradeLog, tpEarlyB3)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+
+if sweepBearFinal
+    bearSweepIdx := bar_index
+    statTotalSweep += 1
+    array.push(tradeLog, pHighVal)
+    array.push(tradeLog, swcTp)
+    array.push(tradeLog, swcSl)
+    array.push(tradeLog, -1.0)
+    array.push(tradeLog, float(bar_index - sweepConfDelay))
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 1.0)
+    array.push(tradeLog, float(hour(time, "Europe/Paris")))
+    array.push(tradeLog, sessionCode)
+    array.push(tradeLog, swcSlTight)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, val_pivot_fresh_bear ? 1.0 : 0.0)
+    [realSlB4, realTpB4] = f_realisticSlTp(close, false, mtfBearConfirm, rsiDivBear)
+    array.push(tradeLog, close)
+    array.push(tradeLog, realSlB4)
+    array.push(tradeLog, realTpB4)
+    array.push(tradeLog, 0.0)
+    entryEarlyB4 = close[earlyOffsetBars]
+    [slEarlyB4, tpEarlyB4] = f_realisticSlTp(entryEarlyB4, false, mtfBearConfirm, rsiDivBear)
+    array.push(tradeLog, entryEarlyB4)
+    array.push(tradeLog, slEarlyB4)
+    array.push(tradeLog, tpEarlyB4)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+    array.push(tradeLog, 0.0)
+
+int nTrades = array.size(tradeLog) / 24
+
+// ══════════════════════════════════════════
+//  PRÉ-ALERTE — tracking séparé, entrée réaliste directement (close),
+//  calculé dans la MÊME exécution que le signal standard ci-dessus.
+// ══════════════════════════════════════════
+var preAlertLog = array.new_float(0)
+var int statTpPreAlert = 0
+var int statSlPreAlert = 0
+
+if preAlertBullFinal
+    preAlertBullIdx := bar_index
+    [paSl1, paTp1] = f_realisticSlTp(close, true, mtfBullConfirm, rsiDivBull)
+    array.push(preAlertLog, close)
+    array.push(preAlertLog, paSl1)
+    array.push(preAlertLog, paTp1)
+    array.push(preAlertLog, 1.0)
+    array.push(preAlertLog, float(bar_index))
+    array.push(preAlertLog, 0.0)
+
+if preAlertBearFinal
+    preAlertBearIdx := bar_index
+    [paSl2, paTp2] = f_realisticSlTp(close, false, mtfBearConfirm, rsiDivBear)
+    array.push(preAlertLog, close)
+    array.push(preAlertLog, paSl2)
+    array.push(preAlertLog, paTp2)
+    array.push(preAlertLog, -1.0)
+    array.push(preAlertLog, float(bar_index))
+    array.push(preAlertLog, 0.0)
+
+int nPreAlert = array.size(preAlertLog) / 6
+if nPreAlert > 0
+    for j = 0 to nPreAlert - 1
+        pbase = j * 6
+        pEntry_i = array.get(preAlertLog, pbase)
+        pSl_i = array.get(preAlertLog, pbase + 1)
+        pTp_i = array.get(preAlertLog, pbase + 2)
+        pDir_i = array.get(preAlertLog, pbase + 3)
+        pSigBar_i = array.get(preAlertLog, pbase + 4)
+        pResolved = array.get(preAlertLog, pbase + 5)
+        if pResolved == 0.0
+            pIsBull = pDir_i > 0
+            pElapsed = bar_index - int(pSigBar_i)
+            pTimeout = pElapsed >= lookForward
+            pTpHit = (pIsBull and high >= pTp_i) or (not pIsBull and low <= pTp_i)
+            pSlHit = (pIsBull and low <= pSl_i) or (not pIsBull and high >= pSl_i)
+            if pSlHit
+                array.set(preAlertLog, pbase + 5, 1.0)
+                statSlPreAlert += 1
+            else if pTpHit
+                array.set(preAlertLog, pbase + 5, 1.0)
+                statTpPreAlert += 1
+            else if pTimeout
+                array.set(preAlertLog, pbase + 5, 1.0)
+                statSlPreAlert += 1
+int statPendSwing = 0
+int statPendSweep = 0
+
+if nTrades > 0
+    for i = 0 to nTrades - 1
+        base = i * 24
+        tp_i = array.get(tradeLog, base + 1)
+        sl_i = array.get(tradeLog, base + 2)
+        dir_i = array.get(tradeLog, base + 3)
+        sigBar_i = array.get(tradeLog, base + 4)
+        resolved = array.get(tradeLog, base + 5)
+        isSweep_i = array.get(tradeLog, base + 6) == 1.0
+        hour_i = int(array.get(tradeLog, base + 7))
+        sess_i = int(array.get(tradeLog, base + 8))
+        tightSl_i = array.get(tradeLog, base + 9)
+        resolvedTight = array.get(tradeLog, base + 10)
+        resolvedClose = array.get(tradeLog, base + 11)
+        wasFreshPivot = array.get(tradeLog, base + 12) == 1.0
+        realEntry_i = array.get(tradeLog, base + 13)
+        realSl_i = array.get(tradeLog, base + 14)
+        realTp_i = array.get(tradeLog, base + 15)
+        resolvedReal = array.get(tradeLog, base + 16)
+        entryEarly_i = array.get(tradeLog, base + 17)
+        slEarly_i = array.get(tradeLog, base + 18)
+        tpEarly_i = array.get(tradeLog, base + 19)
+        resolvedEarly = array.get(tradeLog, base + 20)
+        resolvedRR1 = array.get(tradeLog, base + 21)
+        resolvedRR2 = array.get(tradeLog, base + 22)
+        entry_i = array.get(tradeLog, base + 0)
+        retraceState_i = array.get(tradeLog, base + 23)
+
+        isBull_i = dir_i > 0
+        barsElapsed = bar_index - int(sigBar_i)
+        timeout = barsElapsed >= lookForward
+
+        // Suivi "monte puis redescend vers le pivot" — état 0=pas encore monté,
+        // 1=monté au-dessus du pivot, 2=monté PUIS redescendu vers le pivot
+        // avec tolérance (le motif recherché). Mis à jour tant que non résolu.
+        slDistForRetrace_i = math.abs(entry_i - sl_i)
+        retraceTolDist = slDistForRetrace_i * retraceTolerancePct / 100
+        retraceThreshold_i = isBull_i ? entry_i + retraceTolDist : entry_i - retraceTolDist
+        if resolved == 0.0 and barsElapsed >= 1
+            if retraceState_i == 0.0 and (isBull_i ? high > entry_i : low < entry_i)
+                array.set(tradeLog, base + 23, 1.0)
+                retraceState_i := 1.0
+            else if retraceState_i == 1.0 and (isBull_i ? low <= retraceThreshold_i : high >= retraceThreshold_i)
+                array.set(tradeLog, base + 23, 2.0)
+                retraceState_i := 2.0
+
+        if resolved == 0.0
+            tpHit = (isBull_i and high >= tp_i) or (not isBull_i and low <= tp_i)
+            slHit = (isBull_i and low <= sl_i) or (not isBull_i and high >= sl_i)
+
+            // FIX: quand une même bougie touche à la fois TP et SL, on ne peut pas
+            // savoir avec des données OHLC lequel a été touché en premier dans le temps.
+            // On prend l'hypothèse PESSIMISTE (SL vérifié en premier) plutôt que
+            // d'assumer systématiquement le meilleur cas — sinon le winrate affiché
+            // est artificiellement gonflé, surtout sur les grandes bougies (H4/D1)
+            // où TP et SL peuvent être touchés dans la même bougie.
+            if slHit
+                array.set(tradeLog, base + 5, 1.0)
+                statResolutionTimeSum += barsElapsed
+                statResolutionCount += 1
+                if isSweep_i
+                    statSlSweep += 1
+                else
+                    statSlSwing += 1
+                array.set(hourTotal, hour_i, array.get(hourTotal, hour_i) + 1)
+                array.set(sessTotal, sess_i, array.get(sessTotal, sess_i) + 1)
+                if wasFreshPivot
+                    statSlFreshPivot += 1
+                if not isSweep_i
+                    statSlRetrace += 1
+            else if tpHit
+                array.set(tradeLog, base + 5, 1.0)
+                statResolutionTimeSum += barsElapsed
+                statResolutionCount += 1
+                if isSweep_i
+                    statTpSweep += 1
+                else
+                    statTpSwing += 1
+                array.set(hourTotal, hour_i, array.get(hourTotal, hour_i) + 1)
+                array.set(hourWin, hour_i, array.get(hourWin, hour_i) + 1)
+                array.set(sessTotal, sess_i, array.get(sessTotal, sess_i) + 1)
+                array.set(sessWin, sess_i, array.get(sessWin, sess_i) + 1)
+                if wasFreshPivot
+                    statTpFreshPivot += 1
+                if not isSweep_i and retraceState_i == 2.0
+                    statTpRetrace += 1
+            else if timeout
+                array.set(tradeLog, base + 5, 1.0)
+                statResolutionTimeSum += barsElapsed
+                statResolutionCount += 1
+                if isSweep_i
+                    statSlSweep += 1
+                else
+                    statSlSwing += 1
+                array.set(hourTotal, hour_i, array.get(hourTotal, hour_i) + 1)
+                array.set(sessTotal, sess_i, array.get(sessTotal, sess_i) + 1)
+                if wasFreshPivot
+                    statSlFreshPivot += 1
+                if not isSweep_i
+                    statSlRetrace += 1
+            else
+                if isSweep_i
+                    statPendSweep += 1
+                else
+                    statPendSwing += 1
+
+        // Variante SL serré "Mèche" — se déclenche dès que le prix touche le
+        // niveau (low/high), comme un vrai ordre stop broker. TP identique au signal original.
+        if showSlCompare and resolvedTight == 0.0
+            tpHitT = (isBull_i and high >= tp_i) or (not isBull_i and low <= tp_i)
+            tightSlHit = (isBull_i and low <= tightSl_i) or (not isBull_i and high >= tightSl_i)
+            if tightSlHit
+                array.set(tradeLog, base + 10, 1.0)
+                statSlTight += 1
+            else if tpHitT
+                array.set(tradeLog, base + 10, 1.0)
+                statTpTight += 1
+            else if timeout
+                array.set(tradeLog, base + 10, 1.0)
+                statSlTight += 1
+
+        // Variante SL serré "Clôture" — se déclenche seulement si la bougie
+        // CLÔTURE au-delà du niveau. Ne correspond PAS à un ordre stop classique,
+        // suppose une surveillance manuelle en direct (non exécutable tel quel).
+        if showSlCompare and resolvedClose == 0.0
+            tpHitC = (isBull_i and high >= tp_i) or (not isBull_i and low <= tp_i)
+            closeSlHit = (isBull_i and close <= tightSl_i) or (not isBull_i and close >= tightSl_i)
+            if closeSlHit
+                array.set(tradeLog, base + 11, 1.0)
+                statSlClose += 1
+            else if tpHitC
+                array.set(tradeLog, base + 11, 1.0)
+                statTpClose += 1
+            else if timeout
+                array.set(tradeLog, base + 11, 1.0)
+                statSlClose += 1
+
+        // Variante ENTRÉE RÉALISTE — simule un trade pris au prix de CONFIRMATION
+        // (close de la bougie où l'alerte se déclenche réellement), pas au prix
+        // théorique du pivot. C'est le chiffre le plus proche de ce que vous
+        // pouvez réellement exécuter en trading manuel.
+        if resolvedReal == 0.0
+            isBullR = dir_i > 0
+            tpHitR = (isBullR and high >= realTp_i) or (not isBullR and low <= realTp_i)
+            slHitR = (isBullR and low <= realSl_i) or (not isBullR and high >= realSl_i)
+            if slHitR
+                array.set(tradeLog, base + 16, 1.0)
+                statSlRealistic += 1
+            else if tpHitR
+                array.set(tradeLog, base + 16, 1.0)
+                statTpRealistic += 1
+            else if timeout
+                array.set(tradeLog, base + 16, 1.0)
+                statSlRealistic += 1
+
+        // OPTIMISATION 1 — Entrée anticipée (confirmer X bougies plus tôt,
+        // approximé par le prix de clôture d'il y a X bougies au moment du signal)
+        if showOptimTable and resolvedEarly == 0.0
+            isBullE = dir_i > 0
+            tpHitE = (isBullE and high >= tpEarly_i) or (not isBullE and low <= tpEarly_i)
+            slHitE = (isBullE and low <= slEarly_i) or (not isBullE and high >= slEarly_i)
+            if slHitE
+                array.set(tradeLog, base + 20, 1.0)
+                statSlEarly += 1
+            else if tpHitE
+                array.set(tradeLog, base + 20, 1.0)
+                statTpEarly += 1
+            else if timeout
+                array.set(tradeLog, base + 20, 1.0)
+                statSlEarly += 1
+
+        // OPTIMISATION 2 — RR alternatif 1, même entrée/SL réalistes, TP recalculé
+        if showOptimTable and resolvedRR1 == 0.0
+            isBullG1 = dir_i > 0
+            slDistG1 = math.abs(realEntry_i - realSl_i)
+            tpRR1_i = isBullG1 ? realEntry_i + slDistG1 * altRR1 : realEntry_i - slDistG1 * altRR1
+            tpHitG1 = (isBullG1 and high >= tpRR1_i) or (not isBullG1 and low <= tpRR1_i)
+            slHitG1 = (isBullG1 and low <= realSl_i) or (not isBullG1 and high >= realSl_i)
+            if slHitG1
+                array.set(tradeLog, base + 21, 1.0)
+                statSlRR1 += 1
+            else if tpHitG1
+                array.set(tradeLog, base + 21, 1.0)
+                statTpRR1 += 1
+            else if timeout
+                array.set(tradeLog, base + 21, 1.0)
+                statSlRR1 += 1
+
+        // OPTIMISATION 3 — RR alternatif 2, même principe
+        if showOptimTable and resolvedRR2 == 0.0
+            isBullG2 = dir_i > 0
+            slDistG2 = math.abs(realEntry_i - realSl_i)
+            tpRR2_i = isBullG2 ? realEntry_i + slDistG2 * altRR2 : realEntry_i - slDistG2 * altRR2
+            tpHitG2 = (isBullG2 and high >= tpRR2_i) or (not isBullG2 and low <= tpRR2_i)
+            slHitG2 = (isBullG2 and low <= realSl_i) or (not isBullG2 and high >= realSl_i)
+            if slHitG2
+                array.set(tradeLog, base + 22, 1.0)
+                statSlRR2 += 1
+            else if tpHitG2
+                array.set(tradeLog, base + 22, 1.0)
+                statTpRR2 += 1
+            else if timeout
+                array.set(tradeLog, base + 22, 1.0)
+                statSlRR2 += 1
+
+// ══════════════════════════════════════════
+//  SWING MARKERS
+// ══════════════════════════════════════════
+var label swingHighLbl = na
+var label swingHighLblTxt = na
+var label swingLowLbl = na
+var label swingLowLblTxt = na
+var swingHighArr = array.new_label(0)
+var swingHighTextArr = array.new_label(0)
+var swingLowArr = array.new_label(0)
+var swingLowTextArr = array.new_label(0)
+
+if array.size(swingHighArr) >= 8
+    label.delete(array.shift(swingHighArr))
+    label.delete(array.shift(swingHighTextArr))
+if array.size(swingLowArr) >= 8
+    label.delete(array.shift(swingLowArr))
+    label.delete(array.shift(swingLowTextArr))
+
+if showSwingMarkers and not na(pHigh) and not bearishSFP[lbRight]
+    swingHighLbl := label.new(bar_index[lbRight], high[lbRight], text="", yloc=yloc.abovebar, color=swingClr, textcolor=swingClr, style=label.style_triangledown, size=size.auto)
+    swingHighLblTxt := label.new(bar_index[lbRight], high[lbRight], text="H", yloc=yloc.abovebar, color=swingClr, textcolor=swingClr, style=label.style_none, size=size.tiny)
+    array.push(swingHighArr, swingHighLbl)
+    array.push(swingHighTextArr, swingHighLblTxt)
+
+if showSwingMarkers and not na(pLow) and not bullishSFP[lbRight]
+    swingLowLbl := label.new(bar_index[lbRight], low[lbRight], text="", yloc=yloc.belowbar, color=swingClr, textcolor=swingClr, style=label.style_triangleup, size=size.auto)
+    swingLowLblTxt := label.new(bar_index[lbRight], low[lbRight], text="L", yloc=yloc.belowbar, color=swingClr, textcolor=swingClr, style=label.style_none, size=size.tiny)
+    array.push(swingLowArr, swingLowLbl)
+    array.push(swingLowTextArr, swingLowLblTxt)
+
+// ══════════════════════════════════════════
+//  SWEEP LINES
+// ══════════════════════════════════════════
+if sweepBullFinal
+    x1s = math.max(prevLowIndex - extBars, 0)
+    line.new(x1s, pLowVal, bar_index - sweepConfDelay, pLowVal, color=sweepBullColor, width=sweepLineWidth, style=fLineStyle(sweepLineStyle))
+if sweepBearFinal
+    x1s = math.max(prevHighIndex - extBars, 0)
+    line.new(x1s, pHighVal, bar_index - sweepConfDelay, pHighVal, color=sweepBearColor, width=sweepLineWidth, style=fLineStyle(sweepLineStyle))
+
+// ══════════════════════════════════════════
+//  TRADES SUR GRAPHIQUE
+// ══════════════════════════════════════════
+var lineArr = array.new_line(0)
+var labelArr = array.new_label(0)
+var boxArr = array.new_box(0)
+
+if array.size(lineArr) > maxTrades * 3
+    for _i = 0 to 2
+        line.delete(array.shift(lineArr))
+if array.size(labelArr) > maxTrades * 4
+    for _i = 0 to 3
+        label.delete(array.shift(labelArr))
+if array.size(boxArr) > maxTrades
+    box.delete(array.shift(boxArr))
+
+// ══════════════════════════════════════════
+//  SIGNAUX + DESSIN + ALERTES
+// ══════════════════════════════════════════
+
+// Heure de CONFIRMATION du signal (Europe/Paris) — c'est le moment où le
+// script reconnaît réellement le signal, pas l'heure du pivot/sweep visé
+// en arrière sur le graphique. Utile pour savoir à quelle tranche horaire
+// rattacher ce signal quand on le découvre en différé sur le chart.
+signalHourNow = hour(time, "Europe/Paris")
+signalHourTxt = " | Confirmé: " + str.tostring(signalHourNow) + "h"
+
+var string lastSignalType = "—"
+var int lastSignalHour = -1
+var float lastSigTP = na
+var float lastSigEntryOrig = na
+var bool lastSigIsBull = false
+if swingBullFinal or swingBearFinal or sweepBullFinal or sweepBearFinal
+    lastSignalHour := signalHourNow
+    lastSignalType := swingBullFinal ? "▲ SWING" : swingBearFinal ? "▼ SWING" : sweepBullFinal ? "⚡▲ SWEEP" : "⚡▼ SWEEP"
+    lastSigTP := swingBullFinal ? sbTp : swingBearFinal ? scTp : sweepBullFinal ? swbTp : swcTp
+    lastSigEntryOrig := (swingBullFinal or sweepBullFinal) ? pLowVal : pHighVal
+    lastSigIsBull := swingBullFinal or sweepBullFinal
+
+if swingBullFinal
+    drawTrade(pLowVal, sbSl, sbTp, true, bar_index[lbRight], swingBullColor, lineArr, labelArr, boxArr)
+    lotLbl1 = enableLotCalc ? " | Lot≈" + str.tostring(f_calcLot(pLowVal, sbSl, syminfo.ticker)) + (f_tpExceedsCap(pLowVal, sbTp, sbSl, syminfo.ticker) ? " ⚠️CAP" : "") : ""
+    array.push(labelArr, label.new(bar_index[lbRight], pLowVal, text="▲ SWING L [" + timeframe.period + "]" + lotLbl1 + signalHourTxt + cumulRiskTxt,
+               color=color.new(swingBullColor,10), textcolor=color.white, style=label.style_label_up, size=size.small))
+    if showRetraceLine
+        slDistDraw1 = math.abs(pLowVal - sbSl)
+        retraceLevelDraw1 = pLowVal + slDistDraw1 * retraceTolerancePct / 100
+        xStart1 = bar_index[lbRight]
+        array.push(lineArr, line.new(xStart1, retraceLevelDraw1, xStart1 + retraceLineBars, retraceLevelDraw1, color=retraceLineColor, width=2, style=line.style_solid))
+    if enableAlerts
+        rrA = math.round((sbTp - pLowVal) / math.max(pLowVal - sbSl, 0.00001), 1)
+        val_status = val_valid_bull ? " ✅" + tfLabelFor(valTF) : " ❌" + tfLabelFor(valTF)
+        alert("▲ SWING BULL [" + timeframe.period + "] " + syminfo.ticker + " | Entry: " + priceStr(pLowVal) + " | SL: " + priceStr(sbSl) + " | TP: " + priceStr(sbTp) + " | R:R 1:" + str.tostring(rrA) + val_status + lotLbl1 + cumulRiskTxt, alert.freq_once_per_bar)
+
+if swingBearFinal
+    drawTrade(pHighVal, scSl, scTp, false, bar_index[lbRight], swingBearColor, lineArr, labelArr, boxArr)
+    lotLbl2 = enableLotCalc ? " | Lot≈" + str.tostring(f_calcLot(pHighVal, scSl, syminfo.ticker)) + (f_tpExceedsCap(pHighVal, scTp, scSl, syminfo.ticker) ? " ⚠️CAP" : "") : ""
+    array.push(labelArr, label.new(bar_index[lbRight], pHighVal, text="▼ SWING H [" + timeframe.period + "]" + lotLbl2 + signalHourTxt + cumulRiskTxt,
+               color=color.new(swingBearColor,10), textcolor=color.white, style=label.style_label_down, size=size.small))
+    if showRetraceLine
+        slDistDraw2 = math.abs(pHighVal - scSl)
+        retraceLevelDraw2 = pHighVal - slDistDraw2 * retraceTolerancePct / 100
+        xStart2 = bar_index[lbRight]
+        array.push(lineArr, line.new(xStart2, retraceLevelDraw2, xStart2 + retraceLineBars, retraceLevelDraw2, color=retraceLineColor, width=2, style=line.style_solid))
+    if enableAlerts
+        rrA = math.round((pHighVal - scTp) / math.max(scSl - pHighVal, 0.00001), 1)
+        val_status = val_valid_bear ? " ✅" + tfLabelFor(valTF) : " ❌" + tfLabelFor(valTF)
+        alert("▼ SWING BEAR [" + timeframe.period + "] " + syminfo.ticker + " | Entry: " + priceStr(pHighVal) + " | SL: " + priceStr(scSl) + " | TP: " + priceStr(scTp) + " | R:R 1:" + str.tostring(rrA) + val_status + lotLbl2 + cumulRiskTxt, alert.freq_once_per_bar)
+
+if sweepBullFinal
+    drawTrade(pLowVal, swbSl, swbTp, true, bar_index - sweepConfDelay, sweepBullColor, lineArr, labelArr, boxArr)
+    lotLbl3 = enableLotCalc ? " | Lot≈" + str.tostring(f_calcLot(pLowVal, swbSl, syminfo.ticker)) + (f_tpExceedsCap(pLowVal, swbTp, swbSl, syminfo.ticker) ? " ⚠️CAP" : "") : ""
+    array.push(labelArr, label.new(bar_index - sweepConfDelay, pLowVal, text="⚡▲ SWEEP [" + timeframe.period + "]" + lotLbl3 + signalHourTxt + cumulRiskTxt,
+               color=color.new(sweepBullColor,10), textcolor=color.black, style=label.style_label_up, size=size.small))
+    if enableAlerts
+        rrA = math.round((swbTp - pLowVal) / math.max(pLowVal - swbSl, 0.00001), 1)
+        val_status = val_valid_bull ? " ✅" + tfLabelFor(valTF) : " ❌" + tfLabelFor(valTF)
+        alert("⚡▲ SWEEP BULL [" + timeframe.period + "] " + syminfo.ticker + " | Entry: " + priceStr(pLowVal) + " | SL: " + priceStr(swbSl) + " | TP: " + priceStr(swbTp) + " | R:R 1:" + str.tostring(rrA) + val_status + lotLbl3 + cumulRiskTxt, alert.freq_once_per_bar)
+
+if sweepBearFinal
+    drawTrade(pHighVal, swcSl, swcTp, false, bar_index - sweepConfDelay, sweepBearColor, lineArr, labelArr, boxArr)
+    lotLbl4 = enableLotCalc ? " | Lot≈" + str.tostring(f_calcLot(pHighVal, swcSl, syminfo.ticker)) + (f_tpExceedsCap(pHighVal, swcTp, swcSl, syminfo.ticker) ? " ⚠️CAP" : "") : ""
+    array.push(labelArr, label.new(bar_index - sweepConfDelay, pHighVal, text="⚡▼ SWEEP [" + timeframe.period + "]" + lotLbl4 + signalHourTxt + cumulRiskTxt,
+               color=color.new(sweepBearColor,10), textcolor=color.white, style=label.style_label_down, size=size.small))
+    if enableAlerts
+        rrA = math.round((pHighVal - swcTp) / math.max(swcSl - pHighVal, 0.00001), 1)
+        val_status = val_valid_bear ? " ✅" + tfLabelFor(valTF) : " ❌" + tfLabelFor(valTF)
+        alert("⚡▼ SWEEP BEAR [" + timeframe.period + "] " + syminfo.ticker + " | Entry: " + priceStr(pHighVal) + " | SL: " + priceStr(swcSl) + " | TP: " + priceStr(swcTp) + " | R:R 1:" + str.tostring(rrA) + val_status + lotLbl4 + cumulRiskTxt, alert.freq_once_per_bar)
+
+if preAlertBullFinal
+    [paSl1Disp, paTp1Disp] = f_realisticSlTp(close, true, mtfBullConfirm, rsiDivBull)
+    lotLblPA1 = enableLotCalc ? " | Lot≈" + str.tostring(f_calcLot(close, paSl1Disp, syminfo.ticker)) : ""
+    label.new(bar_index, low, text="🚀 PRÉ-ALERTE ▲" + lotLblPA1 + signalHourTxt + cumulRiskTxt,
+               color=color.new(#00E5FF, 20), textcolor=color.black, style=label.style_label_up, size=size.small)
+    if enableAlerts
+        alert("🚀 PRÉ-ALERTE BULL [" + timeframe.period + "] " + syminfo.ticker + " | Entry≈: " + priceStr(close) + " | SL: " + priceStr(paSl1Disp) + " | TP: " + priceStr(paTp1Disp) + lotLblPA1 + cumulRiskTxt, alert.freq_once_per_bar)
+
+if preAlertBearFinal
+    [paSl2Disp, paTp2Disp] = f_realisticSlTp(close, false, mtfBearConfirm, rsiDivBear)
+    lotLblPA2 = enableLotCalc ? " | Lot≈" + str.tostring(f_calcLot(close, paSl2Disp, syminfo.ticker)) : ""
+    label.new(bar_index, high, text="🚀 PRÉ-ALERTE ▼" + lotLblPA2 + signalHourTxt + cumulRiskTxt,
+               color=color.new(#FF4081, 20), textcolor=color.black, style=label.style_label_down, size=size.small)
+    if enableAlerts
+        alert("🚀 PRÉ-ALERTE BEAR [" + timeframe.period + "] " + syminfo.ticker + " | Entry≈: " + priceStr(close) + " | SL: " + priceStr(paSl2Disp) + " | TP: " + priceStr(paTp2Disp) + lotLblPA2 + cumulRiskTxt, alert.freq_once_per_bar)
+
+// ══════════════════════════════════════════
+//  TABLEAU VALIDATION LTF (taille/position configurables)
+// ══════════════════════════════════════════
+var table valTable = na
+
+if showM15Validator and barstate.islast
+    ts = valTextSize(valTableSize)
+    
+    valTable := table.new(tablePosition(valTablePos), columns=3, rows=10,
+                  bgcolor=color.new(#1a1a2e, 10),
+                  border_color=color.new(#ffffff, 60), border_width=1,
+                  frame_color=color.new(#ffffff, 40), frame_width=1)
+
+    clrHdr  = color.new(#2d2d4e, 0)
+    clrGood = color.new(#1b5e20, 30)
+    clrBad  = color.new(#b71c1c, 30)
+    clrNeu  = color.new(#1a237e, 30)
+    clrWht  = color.white
+    clrGrn  = color.new(#69f0ae, 0)
+    clrRed  = color.new(#ff5252, 0)
+    clrYel  = color.new(#ffeb3b, 0)
+    
+    // Header — affiche la relation Chart TF → Validateur TF
+    modeShort = ltfValidationMode == "Strict (2/2)" ? "ET" : "OU"
+    headerTxt = "📊 VALIDATOR " + tfLabel() + " → " + tfLabelFor(valTF) + " 🔒 [" + modeShort + "]"
+    table.cell(valTable, 0, 0, headerTxt, text_color=clrWht, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+    table.cell(valTable, 1, 0, "BULL ✅", text_color=clrGrn, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+    table.cell(valTable, 2, 0, "BEAR ❌", text_color=clrRed, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+    
+    // Ligne 1 : Confirmation N-1 (avant-dernière bougie clôturée)
+    table.cell(valTable, 0, 1, "✓ Bougie -2 (close)", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    bull_prev = val_prev_confirm_bull ? "✅ YES" : "❌ NO"
+    bear_prev = val_prev_confirm_bear ? "✅ YES" : "❌ NO"
+    table.cell(valTable, 1, 1, bull_prev, text_color=val_prev_confirm_bull ? clrGrn : clrRed, bgcolor=val_prev_confirm_bull ? clrGood : clrBad, text_halign=text.align_center, text_size=ts)
+    table.cell(valTable, 2, 1, bear_prev, text_color=val_prev_confirm_bear ? clrGrn : clrRed, bgcolor=val_prev_confirm_bear ? clrGood : clrBad, text_halign=text.align_center, text_size=ts)
+    
+    // Ligne 2 : Confirmation N (dernière bougie clôturée)
+    table.cell(valTable, 0, 2, "✓ Bougie -1 (close)", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    bull_curr = val_curr_confirm_bull ? "✅ YES" : "❌ NO"
+    bear_curr = val_curr_confirm_bear ? "✅ YES" : "❌ NO"
+    table.cell(valTable, 1, 2, bull_curr, text_color=val_curr_confirm_bull ? clrGrn : clrRed, bgcolor=val_curr_confirm_bull ? clrGood : clrBad, text_halign=text.align_center, text_size=ts)
+    table.cell(valTable, 2, 2, bear_curr, text_color=val_curr_confirm_bear ? clrGrn : clrRed, bgcolor=val_curr_confirm_bear ? clrGood : clrBad, text_halign=text.align_center, text_size=ts)
+    
+    // Ligne 3 : Volume
+    table.cell(valTable, 0, 3, "📊 Vol Boost", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    bull_vol = val_vol_bull ? "✅ YES" : "❌ NO"
+    bear_vol = val_vol_bear ? "✅ YES" : "❌ NO"
+    table.cell(valTable, 1, 3, bull_vol, text_color=val_vol_bull ? clrGrn : clrRed, bgcolor=val_vol_bull ? clrGood : clrBad, text_halign=text.align_center, text_size=ts)
+    table.cell(valTable, 2, 3, bear_vol, text_color=val_vol_bear ? clrGrn : clrRed, bgcolor=val_vol_bear ? clrGood : clrBad, text_halign=text.align_center, text_size=ts)
+    
+    // Ligne 4 : Body
+    table.cell(valTable, 0, 4, "📦 Body Clear", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    bull_body = val_body_bull ? "✅ YES" : "❌ NO"
+    bear_body = val_body_bear ? "✅ YES" : "❌ NO"
+    table.cell(valTable, 1, 4, bull_body, text_color=val_body_bull ? clrGrn : clrRed, bgcolor=val_body_bull ? clrGood : clrBad, text_halign=text.align_center, text_size=ts)
+    table.cell(valTable, 2, 4, bear_body, text_color=val_body_bear ? clrGrn : clrRed, bgcolor=val_body_bear ? clrGood : clrBad, text_halign=text.align_center, text_size=ts)
+    
+    // Ligne 5 : Pivot Level
+    table.cell(valTable, 0, 5, "🎯 Pivot", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    table.cell(valTable, 1, 5, priceStr(val_pivot_bull), text_color=clrYel, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+    table.cell(valTable, 2, 5, priceStr(val_pivot_bear), text_color=clrYel, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+    
+    // Ligne 6 : Price LTF
+    table.cell(valTable, 0, 6, "💹 " + tfLabelFor(valTF) + " Close", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    table.cell(valTable, 1, 6, priceStr(val_close_bull), text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+    table.cell(valTable, 2, 6, priceStr(val_close_bear), text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+    
+    // Ligne 7 : Volume Info
+    table.cell(valTable, 0, 7, "📈 Vol / SMA", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    bull_vol_ratio = val_vol_sma_bull > 0 ? str.tostring(math.round(val_vol_bull_val / val_vol_sma_bull, 2)) : "—"
+    bear_vol_ratio = val_vol_sma_bear > 0 ? str.tostring(math.round(val_vol_bear_val / val_vol_sma_bear, 2)) : "—"
+    table.cell(valTable, 1, 7, bull_vol_ratio + "x", text_color=clrYel, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+    table.cell(valTable, 2, 7, bear_vol_ratio + "x", text_color=clrYel, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+
+    // Ligne 8 : Pivot LTF frais (informatif — comparatif, n'entre PAS dans le verdict)
+    table.cell(valTable, 0, 8, "🆕 Pivot " + tfLabelFor(valTF) + " frais", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    bull_fresh = val_pivot_fresh_bull ? "✅ YES" : "❌ NO"
+    bear_fresh = val_pivot_fresh_bear ? "✅ YES" : "❌ NO"
+    table.cell(valTable, 1, 8, bull_fresh, text_color=val_pivot_fresh_bull ? clrGrn : clrRed, bgcolor=val_pivot_fresh_bull ? clrGood : clrBad, text_halign=text.align_center, text_size=ts)
+    table.cell(valTable, 2, 8, bear_fresh, text_color=val_pivot_fresh_bear ? clrGrn : clrRed, bgcolor=val_pivot_fresh_bear ? clrGood : clrBad, text_halign=text.align_center, text_size=ts)
+    
+    // Ligne 9 : VERDICT (4 conditions: N-1, N, Vol Boost, Body Clear)
+    table.cell(valTable, 0, 9, "🎯 VERDICT", text_color=clrWht, bgcolor=clrHdr, text_halign=text.align_left, text_size=ts)
+    bull_verdict = val_valid_bull ? "✅ GO" : "❌ SKIP"
+    bear_verdict = val_valid_bear ? "✅ GO" : "❌ SKIP"
+    bull_v_color = val_valid_bull ? clrGood : clrBad
+    bear_v_color = val_valid_bear ? clrGood : clrBad
+    table.cell(valTable, 1, 9, bull_verdict, text_color=clrWht, bgcolor=bull_v_color, text_halign=text.align_center, text_size=ts)
+    table.cell(valTable, 2, 9, bear_verdict, text_color=clrWht, bgcolor=bear_v_color, text_halign=text.align_center, text_size=ts)
+
+// ══════════════════════════════════════════
+//  TABLEAU STATS
+// ══════════════════════════════════════════
+var table statsTable = na
+
+if showTable and barstate.islast
+    ts = tableTxtSize
+    resSwing = statTpSwing + statSlSwing
+    resSweep = statTpSweep + statSlSweep
+    wr1 = resSwing > 0 ? math.round(statTpSwing / resSwing * 100, 1) : 0.0
+    wr2 = resSweep > 0 ? math.round(statTpSweep / resSweep * 100, 1) : 0.0
+    wc1 = wr1 >= 60 ? color.new(#1b5e20,30) : wr1 >= 45 ? color.new(#37474f,30) : color.new(#b71c1c,30)
+    wc2 = wr2 >= 60 ? color.new(#1b5e20,30) : wr2 >= 45 ? color.new(#37474f,30) : color.new(#b71c1c,30)
+    avgResolutionTime = statResolutionCount > 0 ? math.round(statResolutionTimeSum / statResolutionCount, 1) : 0.0
+
+    statsTable := table.new(tablePosition(tablePos), columns=3, rows=17,
+                  bgcolor=color.new(#1a1a2e, 10),
+                  border_color=color.new(#ffffff, 60), border_width=1,
+                  frame_color=color.new(#ffffff, 40), frame_width=1)
+
+    clrHdr  = color.new(#2d2d4e, 0)
+    clrNeu  = color.new(#1a237e, 30)
+    clrGood = color.new(#1b5e20, 30)
+    clrBad  = color.new(#b71c1c, 30)
+    clrPend = color.new(#37474f, 30)
+    clrWht  = color.white
+    clrGrn  = color.new(#69f0ae, 0)
+    clrRed  = color.new(#ff5252, 0)
+    clrYel  = color.new(#ffeb3b, 0)
+    clrCya  = color.new(#80deea, 0)
+    clrGry  = color.new(#aaaaaa, 0)
+
+    table.cell(statsTable, 0, 0, "📊 " + syminfo.ticker + " | ATR×" + str.tostring(atrSlMul) + " RR:" + str.tostring(atrTpRR), text_color=clrWht, bgcolor=clrHdr, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 0, "📐 SWING", text_color=clrCya, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 0, "⚡ SWEEP", text_color=clrYel, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+
+    mtfDisplayStr = useMTF ? mtfPeriod : "OFF"
+    atrMtfStr = mtfAtrUsed ? " (ATR-MTF)" : ""
+    rsiDivStr = useRsiDiv ? " | ✅RSI" : " | ❌RSI"
+    table.cell(statsTable, 0, 1, "TF: " + tfLabel() + " | MTF: " + mtfDisplayStr + atrMtfStr + rsiDivStr, text_color=clrGry, bgcolor=clrHdr, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 1, timeframe.period, text_color=clrGry, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 1, "ATR: " + priceStr(atrVal), text_color=clrGry, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+
+    table.cell(statsTable, 0, 2, "Total", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 2, str.tostring(statTotalSwing), text_color=clrCya, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 2, str.tostring(statTotalSweep), text_color=clrYel, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+
+    table.cell(statsTable, 0, 3, "Résolus", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 3, str.tostring(resSwing), text_color=clrCya, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 3, str.tostring(resSweep), text_color=clrYel, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+
+    table.cell(statsTable, 0, 4, "⏳ En attente", text_color=clrWht, bgcolor=clrPend, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 4, str.tostring(statPendSwing), text_color=clrYel, bgcolor=clrPend, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 4, str.tostring(statPendSweep), text_color=clrYel, bgcolor=clrPend, text_halign=text.align_center, text_size=ts)
+
+    table.cell(statsTable, 0, 5, "✅ TP", text_color=clrWht, bgcolor=clrGood, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 5, str.tostring(statTpSwing) + " (" + pct(statTpSwing, resSwing) + ")", text_color=clrGrn, bgcolor=clrGood, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 5, str.tostring(statTpSweep) + " (" + pct(statTpSweep, resSweep) + ")", text_color=clrGrn, bgcolor=clrGood, text_halign=text.align_center, text_size=ts)
+
+    table.cell(statsTable, 0, 6, "❌ SL", text_color=clrWht, bgcolor=clrBad, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 6, str.tostring(statSlSwing) + " (" + pct(statSlSwing, resSwing) + ")", text_color=clrRed, bgcolor=clrBad, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 6, str.tostring(statSlSweep) + " (" + pct(statSlSweep, resSweep) + ")", text_color=clrRed, bgcolor=clrBad, text_halign=text.align_center, text_size=ts)
+
+    table.cell(statsTable, 0, 7, "🏆 WR", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 7, pct(statTpSwing, resSwing), text_color=wr1 >= 60 ? clrGrn : wr1 >= 45 ? clrYel : clrRed, bgcolor=wc1, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 7, pct(statTpSweep, resSweep), text_color=wr2 >= 60 ? clrGrn : wr2 >= 45 ? clrYel : clrRed, bgcolor=wc2, text_halign=text.align_center, text_size=ts)
+
+    exp1 = math.round(wr1/100 * atrTpRR - (1 - wr1/100), 2)
+    exp2 = math.round(wr2/100 * atrTpRR - (1 - wr2/100), 2)
+    ec1 = exp1 > 0 ? clrGood : clrBad
+    ec2 = exp2 > 0 ? clrGood : clrBad
+    table.cell(statsTable, 0, 8, "💰 Espérance", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 8, str.tostring(exp1), text_color=exp1 > 0 ? clrGrn : clrRed, bgcolor=ec1, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 8, str.tostring(exp2), text_color=exp2 > 0 ? clrGrn : clrRed, bgcolor=ec2, text_halign=text.align_center, text_size=ts)
+
+    filtreLabel = (useEma ? "EMA " : "") + (useRsi ? "RSI " : "") + (useBody ? "Body" : "")
+    filtreLabel := filtreLabel == "" ? "Aucun" : filtreLabel
+    table.cell(statsTable, 0, 9, "🔍 Filtres", text_color=clrGry, bgcolor=clrHdr, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 9, filtreLabel, text_color=clrGry, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 9, "Fen: " + str.tostring(lookForward) + "b", text_color=clrGry, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+
+    table.cell(statsTable, 0, 10, autoTf ? "✅ Pivot AUTO" : "⚙️ Manuel", text_color=clrGry, bgcolor=clrHdr, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 10, "cd: " + str.tostring(cooldownPeriod) + "b", text_color=clrGry, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 10, "max: " + str.tostring(maxTrades), text_color=clrGry, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+
+    table.cell(statsTable, 0, 11, "⏱️ Res. Time", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 11, str.tostring(avgResolutionTime) + "b", text_color=clrYel, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 11, "", text_color=clrGry, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+
+    table.cell(statsTable, 0, 12, "📊 Dernier signal", text_color=clrWht, bgcolor=clrNeu, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 12, lastSignalType, text_color=clrYel, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 12, lastSignalHour >= 0 ? "Confirmé: " + str.tostring(lastSignalHour) + "h" : "", text_color=clrGry, bgcolor=clrNeu, text_halign=text.align_center, text_size=ts)
+
+    mmRiskPctDisplay = mmMode == "Évaluation" ? riskPctEval : riskPctFunded
+    table.cell(statsTable, 0, 13, "💰 MM: " + mmMode, text_color=clrWht, bgcolor=clrHdr, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 13, "Risk: " + str.tostring(mmRiskPctDisplay) + "%", text_color=clrYel, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 13, "Bal: " + str.tostring(accountBalance) + accountCurrency, text_color=clrGry, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+
+    resFresh = statTpFreshPivot + statSlFreshPivot
+    wrFresh = resFresh > 0 ? math.round(statTpFreshPivot / resFresh * 100, 1) : 0.0
+    expFresh = resFresh > 0 ? math.round(wrFresh/100 * atrTpRR - (1 - wrFresh/100), 2) : 0.0
+    wcFresh = wrFresh >= 60 ? clrGood : wrFresh >= 45 ? clrPend : clrBad
+    table.cell(statsTable, 0, 14, "🆕 WR Pivot " + tfLabelFor(valTF) + " frais", text_color=clrWht, bgcolor=clrHdr, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 14, resFresh > 0 ? str.tostring(wrFresh) + "% (n=" + str.tostring(resFresh) + ")" : "— (0)", text_color=clrWht, bgcolor=wcFresh, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 14, resFresh > 0 ? "Esp: " + str.tostring(expFresh) : "—", text_color=clrGry, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+
+    resRealistic = statTpRealistic + statSlRealistic
+    wrRealistic = resRealistic > 0 ? math.round(statTpRealistic / resRealistic * 100, 1) : 0.0
+    expRealistic = resRealistic > 0 ? math.round(wrRealistic/100 * atrTpRR - (1 - wrRealistic/100), 2) : 0.0
+    clrRealisticHdr = color.new(#E65100, 0)
+    wcRealistic = wrRealistic >= 60 ? clrGood : wrRealistic >= 45 ? clrPend : clrBad
+    table.cell(statsTable, 0, 15, "🎯 WR ENTRÉE RÉALISTE", text_color=color.white, bgcolor=clrRealisticHdr, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 15, resRealistic > 0 ? str.tostring(wrRealistic) + "% (n=" + str.tostring(resRealistic) + ")" : "— (0)", text_color=color.white, bgcolor=wcRealistic, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 15, resRealistic > 0 ? "Esp: " + str.tostring(expRealistic) : "—", text_color=color.white, bgcolor=clrRealisticHdr, text_halign=text.align_center, text_size=ts)
+
+    resRetrace = statTpRetrace + statSlRetrace
+    wrRetrace = resRetrace > 0 ? math.round(statTpRetrace / resRetrace * 100, 1) : 0.0
+    expRetrace = resRetrace > 0 ? math.round(wrRetrace/100 * atrTpRR - (1 - wrRetrace/100), 2) : 0.0
+    wcRetrace = wrRetrace >= 60 ? clrGood : wrRetrace >= 45 ? clrPend : clrBad
+    table.cell(statsTable, 0, 16, "🔄 WR Swing (retour ±" + str.tostring(retraceTolerancePct) + "%)", text_color=clrWht, bgcolor=clrHdr, text_halign=text.align_left, text_size=ts)
+    table.cell(statsTable, 1, 16, resRetrace > 0 ? str.tostring(wrRetrace) + "% (n=" + str.tostring(resRetrace) + ")" : "— (0)", text_color=clrWht, bgcolor=wcRetrace, text_halign=text.align_center, text_size=ts)
+    table.cell(statsTable, 2, 16, resRetrace > 0 ? "Esp: " + str.tostring(expRetrace) : "—", text_color=clrGry, bgcolor=clrHdr, text_halign=text.align_center, text_size=ts)
+
+// ══════════════════════════════════════════
+//  TABLEAU WINRATE PAR HORAIRE (Europe/Paris)
+// ══════════════════════════════════════════
+var table hourlyTable = na
+
+if showHourlyTable and barstate.islast
+    hts = valTextSize(hourlyTableSize)
+    hourlyTable := table.new(tablePosition(hourlyTablePos), columns=3, rows=25,
+                  bgcolor=color.new(#1a1a2e, 10),
+                  border_color=color.new(#ffffff, 60), border_width=1,
+                  frame_color=color.new(#ffffff, 40), frame_width=1)
+
+    hClrHdr = color.new(#2d2d4e, 0)
+    hClrWht = color.white
+    hClrGrn = color.new(#69f0ae, 0)
+    hClrYel = color.new(#ffeb3b, 0)
+    hClrRed = color.new(#ff5252, 0)
+    hClrNeu = color.new(#1a237e, 30)
+
+    table.cell(hourlyTable, 0, 0, "🕐 Heure (Paris)", text_color=hClrWht, bgcolor=hClrHdr, text_halign=text.align_left, text_size=hts)
+    table.cell(hourlyTable, 1, 0, "Trades", text_color=hClrWht, bgcolor=hClrHdr, text_halign=text.align_center, text_size=hts)
+    table.cell(hourlyTable, 2, 0, "Winrate", text_color=hClrWht, bgcolor=hClrHdr, text_halign=text.align_center, text_size=hts)
+
+    int rowPtr = 1
+    for h = 0 to 23
+        hTotal = array.get(hourTotal, h)
+        if hTotal >= hourlyMinSample
+            hWin = array.get(hourWin, h)
+            hWr = math.round(hWin / hTotal * 100, 1)
+            wrColor = hWr >= 60 ? hClrGrn : hWr >= 45 ? hClrYel : hClrRed
+            hourStr = str.tostring(h) + "h–" + str.tostring(h+1) + "h"
+            table.cell(hourlyTable, 0, rowPtr, hourStr, text_color=hClrWht, bgcolor=hClrNeu, text_halign=text.align_left, text_size=hts)
+            table.cell(hourlyTable, 1, rowPtr, str.tostring(hTotal), text_color=hClrWht, bgcolor=hClrNeu, text_halign=text.align_center, text_size=hts)
+            table.cell(hourlyTable, 2, rowPtr, str.tostring(hWr) + "%", text_color=color.black, bgcolor=wrColor, text_halign=text.align_center, text_size=hts)
+            rowPtr := rowPtr + 1
+
+    if rowPtr == 1
+        table.cell(hourlyTable, 0, 1, "Pas encore assez de données", text_color=color.gray, bgcolor=hClrHdr, text_halign=text.align_left, text_size=hts)
+        table.cell(hourlyTable, 1, 1, "", bgcolor=hClrHdr)
+        table.cell(hourlyTable, 2, 1, "", bgcolor=hClrHdr)
+
+// ══════════════════════════════════════════
+//  TABLEAU WINRATE PAR SESSION (Londres / New York)
+// ══════════════════════════════════════════
+var table sessionTable = na
+
+if showSessionTable and barstate.islast
+    sts = valTextSize(sessionTableSize)
+    sessionTable := table.new(tablePosition(sessionTablePos), columns=3, rows=5,
+                  bgcolor=color.new(#1a1a2e, 10),
+                  border_color=color.new(#ffffff, 60), border_width=1,
+                  frame_color=color.new(#ffffff, 40), frame_width=1)
+
+    sClrHdr = color.new(#2d2d4e, 0)
+    sClrWht = color.white
+    sClrGrn = color.new(#69f0ae, 0)
+    sClrYel = color.new(#ffeb3b, 0)
+    sClrRed = color.new(#ff5252, 0)
+    sClrNeu = color.new(#1a237e, 30)
+
+    table.cell(sessionTable, 0, 0, "🌍 Session" + (useSessionFilter ? " [Filtré]" : ""), text_color=sClrWht, bgcolor=sClrHdr, text_halign=text.align_left, text_size=sts)
+    table.cell(sessionTable, 1, 0, "Trades", text_color=sClrWht, bgcolor=sClrHdr, text_halign=text.align_center, text_size=sts)
+    table.cell(sessionTable, 2, 0, "Winrate", text_color=sClrWht, bgcolor=sClrHdr, text_halign=text.align_center, text_size=sts)
+
+    sessLabels = array.from("Hors session", "Londres", "New York", "Chevauchement")
+    for sIdx = 0 to 3
+        sTotal = array.get(sessTotal, sIdx)
+        sWin = array.get(sessWin, sIdx)
+        rowIdx = sIdx + 1
+        if sTotal > 0
+            sWr = math.round(sWin / sTotal * 100, 1)
+            sWrColor = sWr >= 60 ? sClrGrn : sWr >= 45 ? sClrYel : sClrRed
+            table.cell(sessionTable, 0, rowIdx, array.get(sessLabels, sIdx), text_color=sClrWht, bgcolor=sClrNeu, text_halign=text.align_left, text_size=sts)
+            table.cell(sessionTable, 1, rowIdx, str.tostring(sTotal), text_color=sClrWht, bgcolor=sClrNeu, text_halign=text.align_center, text_size=sts)
+            table.cell(sessionTable, 2, rowIdx, str.tostring(sWr) + "%", text_color=color.black, bgcolor=sWrColor, text_halign=text.align_center, text_size=sts)
+        else
+            table.cell(sessionTable, 0, rowIdx, array.get(sessLabels, sIdx), text_color=color.gray, bgcolor=sClrNeu, text_halign=text.align_left, text_size=sts)
+            table.cell(sessionTable, 1, rowIdx, "0", text_color=color.gray, bgcolor=sClrNeu, text_halign=text.align_center, text_size=sts)
+            table.cell(sessionTable, 2, rowIdx, "—", text_color=color.gray, bgcolor=sClrNeu, text_halign=text.align_center, text_size=sts)
+
+
+// ══════════════════════════════════════════
+//  TABLEAU COMPARATIF SL SERRÉ (Structurel vs Mèche vs Clôture)
+// ══════════════════════════════════════════
+var table slCompareTable = na
+
+if showSlCompare and barstate.islast
+    cts = valTextSize(slCompareTableSize)
+    slCompareTable := table.new(tablePosition(slCompareTablePos), columns=3, rows=4,
+                  bgcolor=color.new(#1a1a2e, 10),
+                  border_color=color.new(#ffffff, 60), border_width=1,
+                  frame_color=color.new(#ffffff, 40), frame_width=1)
+
+    cClrHdr = color.new(#2d2d4e, 0)
+    cClrWht = color.white
+    cClrGrn = color.new(#69f0ae, 0)
+    cClrYel = color.new(#ffeb3b, 0)
+    cClrRed = color.new(#ff5252, 0)
+    cClrNeu = color.new(#1a237e, 30)
+    cClrGry = color.new(#aaaaaa, 0)
+
+    table.cell(slCompareTable, 0, 0, "🔬 SL ×" + str.tostring(atrSlMulTight), text_color=cClrWht, bgcolor=cClrHdr, text_halign=text.align_left, text_size=cts)
+    table.cell(slCompareTable, 1, 0, "Trades", text_color=cClrWht, bgcolor=cClrHdr, text_halign=text.align_center, text_size=cts)
+    table.cell(slCompareTable, 2, 0, "Winrate", text_color=cClrWht, bgcolor=cClrHdr, text_halign=text.align_center, text_size=cts)
+
+    resStruct = statTpSwing + statSlSwing + statTpSweep + statSlSweep
+    tpStruct = statTpSwing + statTpSweep
+    wrStruct = resStruct > 0 ? math.round(tpStruct / resStruct * 100, 1) : 0.0
+    table.cell(slCompareTable, 0, 1, "Structurel (actuel)", text_color=cClrWht, bgcolor=cClrNeu, text_halign=text.align_left, text_size=cts)
+    table.cell(slCompareTable, 1, 1, str.tostring(resStruct), text_color=cClrGry, bgcolor=cClrNeu, text_halign=text.align_center, text_size=cts)
+    table.cell(slCompareTable, 2, 1, resStruct > 0 ? str.tostring(wrStruct) + "%" : "—", text_color=color.black, bgcolor=(wrStruct >= 60 ? cClrGrn : wrStruct >= 45 ? cClrYel : cClrRed), text_halign=text.align_center, text_size=cts)
+
+    resTight = statTpTight + statSlTight
+    wrTight = resTight > 0 ? math.round(statTpTight / resTight * 100, 1) : 0.0
+    table.cell(slCompareTable, 0, 2, "Serré — Mèche ✅exécutable", text_color=cClrWht, bgcolor=cClrNeu, text_halign=text.align_left, text_size=cts)
+    table.cell(slCompareTable, 1, 2, str.tostring(resTight), text_color=cClrGry, bgcolor=cClrNeu, text_halign=text.align_center, text_size=cts)
+    table.cell(slCompareTable, 2, 2, resTight > 0 ? str.tostring(wrTight) + "%" : "—", text_color=color.black, bgcolor=(wrTight >= 60 ? cClrGrn : wrTight >= 45 ? cClrYel : cClrRed), text_halign=text.align_center, text_size=cts)
+
+    resClose = statTpClose + statSlClose
+    wrClose = resClose > 0 ? math.round(statTpClose / resClose * 100, 1) : 0.0
+    table.cell(slCompareTable, 0, 3, "Serré — Clôture ⚠️manuel", text_color=cClrWht, bgcolor=cClrNeu, text_halign=text.align_left, text_size=cts)
+    table.cell(slCompareTable, 1, 3, str.tostring(resClose), text_color=cClrGry, bgcolor=cClrNeu, text_halign=text.align_center, text_size=cts)
+    table.cell(slCompareTable, 2, 3, resClose > 0 ? str.tostring(wrClose) + "%" : "—", text_color=color.black, bgcolor=(wrClose >= 60 ? cClrGrn : wrClose >= 45 ? cClrYel : cClrRed), text_halign=text.align_center, text_size=cts)
+
+
+// ══════════════════════════════════════════
+//  TABLEAU OPTIMISATION ENTRÉE RÉALISTE
+//  Compare l'entrée réaliste actuelle à deux pistes d'amélioration:
+//  confirmer plus tôt, et/ou viser un RR plus faible.
+// ══════════════════════════════════════════
+var table optimTable = na
+
+if showOptimTable and barstate.islast
+    ots = valTextSize(optimTableSize)
+    optimTable := table.new(tablePosition(optimTablePos), columns=4, rows=5,
+                  bgcolor=color.new(#1a1a2e, 10),
+                  border_color=color.new(#ffffff, 60), border_width=1,
+                  frame_color=color.new(#ffffff, 40), frame_width=1)
+
+    oClrHdr = color.new(#2d2d4e, 0)
+    oClrWht = color.white
+    oClrGrn = color.new(#69f0ae, 0)
+    oClrYel = color.new(#ffeb3b, 0)
+    oClrRed = color.new(#ff5252, 0)
+    oClrNeu = color.new(#1a237e, 30)
+    oClrGry = color.new(#aaaaaa, 0)
+
+    table.cell(optimTable, 0, 0, "🔬 Optimisation", text_color=oClrWht, bgcolor=oClrHdr, text_halign=text.align_left, text_size=ots)
+    table.cell(optimTable, 1, 0, "n", text_color=oClrWht, bgcolor=oClrHdr, text_halign=text.align_center, text_size=ots)
+    table.cell(optimTable, 2, 0, "WR", text_color=oClrWht, bgcolor=oClrHdr, text_halign=text.align_center, text_size=ots)
+    table.cell(optimTable, 3, 0, "Espérance", text_color=oClrWht, bgcolor=oClrHdr, text_halign=text.align_center, text_size=ots)
+
+    // Ligne 1 : référence — entrée réaliste actuelle (RR courant)
+    resRealOpt = statTpRealistic + statSlRealistic
+    wrRealOpt = resRealOpt > 0 ? math.round(statTpRealistic / resRealOpt * 100, 1) : 0.0
+    expRealOpt = resRealOpt > 0 ? math.round(wrRealOpt/100 * atrTpRR - (1 - wrRealOpt/100), 2) : 0.0
+    table.cell(optimTable, 0, 1, "Actuel (RR " + str.tostring(atrTpRR) + ")", text_color=oClrWht, bgcolor=oClrNeu, text_halign=text.align_left, text_size=ots)
+    table.cell(optimTable, 1, 1, str.tostring(resRealOpt), text_color=oClrGry, bgcolor=oClrNeu, text_halign=text.align_center, text_size=ots)
+    table.cell(optimTable, 2, 1, resRealOpt > 0 ? str.tostring(wrRealOpt) + "%" : "—", text_color=oClrWht, bgcolor=oClrNeu, text_halign=text.align_center, text_size=ots)
+    table.cell(optimTable, 3, 1, resRealOpt > 0 ? str.tostring(expRealOpt) : "—", text_color=expRealOpt > 0 ? oClrGrn : oClrRed, bgcolor=oClrNeu, text_halign=text.align_center, text_size=ots)
+
+    // Ligne 2 : confirmation anticipée
+    resEarly = statTpEarly + statSlEarly
+    wrEarly = resEarly > 0 ? math.round(statTpEarly / resEarly * 100, 1) : 0.0
+    expEarly = resEarly > 0 ? math.round(wrEarly/100 * atrTpRR - (1 - wrEarly/100), 2) : 0.0
+    table.cell(optimTable, 0, 2, "-" + str.tostring(earlyOffsetBars) + " bougies (RR " + str.tostring(atrTpRR) + ")", text_color=oClrWht, bgcolor=oClrNeu, text_halign=text.align_left, text_size=ots)
+    table.cell(optimTable, 1, 2, str.tostring(resEarly), text_color=oClrGry, bgcolor=oClrNeu, text_halign=text.align_center, text_size=ots)
+    table.cell(optimTable, 2, 2, resEarly > 0 ? str.tostring(wrEarly) + "%" : "—", text_color=oClrWht, bgcolor=oClrNeu, text_halign=text.align_center, text_size=ots)
+    table.cell(optimTable, 3, 2, resEarly > 0 ? str.tostring(expEarly) : "—", text_color=expEarly > 0 ? oClrGrn : oClrRed, bgcolor=oClrNeu, text_halign=text.align_center, text_size=ots)
+
+    // Ligne 3 : RR alternatif 1
+    resRR1 = statTpRR1 + statSlRR1
+    wrRR1 = resRR1 > 0 ? math.round(statTpRR1 / resRR1 * 100, 1) : 0.0
+    expRR1 = resRR1 > 0 ? math.round(wrRR1/100 * altRR1 - (1 - wrRR1/100), 2) : 0.0
+    table.cell(optimTable, 0, 3, "RR " + str.tostring(altRR1) + " (entrée actuelle)", text_color=oClrWht, bgcolor=oClrNeu, text_halign=text.align_left, text_size=ots)
+    table.cell(optimTable, 1, 3, str.tostring(resRR1), text_color=oClrGry, bgcolor=oClrNeu, text_halign=text.align_center, text_size=ots)
+    table.cell(optimTable, 2, 3, resRR1 > 0 ? str.tostring(wrRR1) + "%" : "—", text_color=oClrWht, bgcolor=oClrNeu, text_halign=text.align_center, text_size=ots)
+    table.cell(optimTable, 3, 3, resRR1 > 0 ? str.tostring(expRR1) : "—", text_color=expRR1 > 0 ? oClrGrn : oClrRed, bgcolor=oClrNeu, text_halign=text.align_center, text_size=ots)
+
+    // Ligne 4 : RR alternatif 2
+    resRR2 = statTpRR2 + statSlRR2
+    wrRR2 = resRR2 > 0 ? math.round(statTpRR2 / resRR2 * 100, 1) : 0.0
+    expRR2 = resRR2 > 0 ? math.round(wrRR2/100 * altRR2 - (1 - wrRR2/100), 2) : 0.0
+    table.cell(optimTable, 0, 4, "RR " + str.tostring(altRR2) + " (entrée actuelle)", text_color=oClrWht, bgcolor=oClrNeu, text_halign=text.align_left, text_size=ots)
+    table.cell(optimTable, 1, 4, str.tostring(resRR2), text_color=oClrGry, bgcolor=oClrNeu, text_halign=text.align_center, text_size=ots)
+    table.cell(optimTable, 2, 4, resRR2 > 0 ? str.tostring(wrRR2) + "%" : "—", text_color=oClrWht, bgcolor=oClrNeu, text_halign=text.align_center, text_size=ots)
+    table.cell(optimTable, 3, 4, resRR2 > 0 ? str.tostring(expRR2) : "—", text_color=expRR2 > 0 ? oClrGrn : oClrRed, bgcolor=oClrNeu, text_halign=text.align_center, text_size=ots)
+
+
+// ══════════════════════════════════════════
+//  TABLEAU COMPARATIF STANDARD vs PRÉ-ALERTE
+//  Les deux variantes sont calculées dans la MÊME exécution, sur les
+//  MÊMES bougies — comparaison propre, sans biais de fenêtre glissante.
+// ══════════════════════════════════════════
+var table preAlertTable = na
+
+if showPreAlert and barstate.islast
+    pts = valTextSize(preAlertTableSize)
+    preAlertTable := table.new(tablePosition(preAlertTablePos), columns=4, rows=3,
+                  bgcolor=color.new(#1a1a2e, 10),
+                  border_color=color.new(#ffffff, 60), border_width=1,
+                  frame_color=color.new(#ffffff, 40), frame_width=1)
+
+    ptClrHdr = color.new(#004D40, 0)
+    ptClrWht = color.white
+    ptClrGrn = color.new(#69f0ae, 0)
+    ptClrRed = color.new(#ff5252, 0)
+    ptClrNeu = color.new(#1a237e, 30)
+    ptClrGry = color.new(#aaaaaa, 0)
+
+    table.cell(preAlertTable, 0, 0, "🚀 Standard vs Pré-Alerte", text_color=ptClrWht, bgcolor=ptClrHdr, text_halign=text.align_left, text_size=pts)
+    table.cell(preAlertTable, 1, 0, "n", text_color=ptClrWht, bgcolor=ptClrHdr, text_halign=text.align_center, text_size=pts)
+    table.cell(preAlertTable, 2, 0, "WR", text_color=ptClrWht, bgcolor=ptClrHdr, text_halign=text.align_center, text_size=pts)
+    table.cell(preAlertTable, 3, 0, "Espérance", text_color=ptClrWht, bgcolor=ptClrHdr, text_halign=text.align_center, text_size=pts)
+
+    resStdPA = statTpRealistic + statSlRealistic
+    wrStdPA = resStdPA > 0 ? math.round(statTpRealistic / resStdPA * 100, 1) : 0.0
+    expStdPA = resStdPA > 0 ? math.round(wrStdPA/100 * atrTpRR - (1 - wrStdPA/100), 2) : 0.0
+    table.cell(preAlertTable, 0, 1, "Standard (lbRight " + str.tostring(lbRight) + ")", text_color=ptClrWht, bgcolor=ptClrNeu, text_halign=text.align_left, text_size=pts)
+    table.cell(preAlertTable, 1, 1, str.tostring(resStdPA), text_color=ptClrGry, bgcolor=ptClrNeu, text_halign=text.align_center, text_size=pts)
+    table.cell(preAlertTable, 2, 1, resStdPA > 0 ? str.tostring(wrStdPA) + "%" : "—", text_color=ptClrWht, bgcolor=ptClrNeu, text_halign=text.align_center, text_size=pts)
+    table.cell(preAlertTable, 3, 1, resStdPA > 0 ? str.tostring(expStdPA) : "—", text_color=expStdPA > 0 ? ptClrGrn : ptClrRed, bgcolor=ptClrNeu, text_halign=text.align_center, text_size=pts)
+
+    resPA = statTpPreAlert + statSlPreAlert
+    wrPA = resPA > 0 ? math.round(statTpPreAlert / resPA * 100, 1) : 0.0
+    expPA = resPA > 0 ? math.round(wrPA/100 * atrTpRR - (1 - wrPA/100), 2) : 0.0
+    table.cell(preAlertTable, 0, 2, "Pré-Alerte (lbRight " + str.tostring(preAlertLbRight) + ")", text_color=ptClrWht, bgcolor=ptClrNeu, text_halign=text.align_left, text_size=pts)
+    table.cell(preAlertTable, 1, 2, str.tostring(resPA), text_color=ptClrGry, bgcolor=ptClrNeu, text_halign=text.align_center, text_size=pts)
+    table.cell(preAlertTable, 2, 2, resPA > 0 ? str.tostring(wrPA) + "%" : "—", text_color=ptClrWht, bgcolor=ptClrNeu, text_halign=text.align_center, text_size=pts)
+    table.cell(preAlertTable, 3, 2, resPA > 0 ? str.tostring(expPA) : "—", text_color=expPA > 0 ? ptClrGrn : ptClrRed, bgcolor=ptClrNeu, text_halign=text.align_center, text_size=pts)
+
+
+// ══════════════════════════════════════════
+//  AIDE ENTRÉE TARDIVE — recalcul continu SL depuis le prix actuel,
+//  TP fixe du dernier signal, R:R préservé.
+// ══════════════════════════════════════════
+liveEntryPx = close
+atrNowForLate = mtfAtrUsed ? atrValMTF : atrVal
+minSlDistFloor = atrNowForLate * lateEntryMinAtrFrac
+
+hasRecentSignal = not na(lastSigTP)
+remainingDist = hasRecentSignal ? (lastSigIsBull ? (lastSigTP - liveEntryPx) : (liveEntryPx - lastSigTP)) : na
+neededSlDist = (hasRecentSignal and remainingDist > 0) ? remainingDist / lateEntryMinRR : na
+liveSlPx = not na(neededSlDist) ? (lastSigIsBull ? liveEntryPx - neededSlDist : liveEntryPx + neededSlDist) : na
+
+lateVerdictTxt = not hasRecentSignal ? "— Aucun signal récent" :
+                 remainingDist <= 0 ? "❌ TP déjà atteint/dépassé" :
+                 neededSlDist < minSlDistFloor ? "❌ Marge insuffisante (trop tardif)" :
+                 "✅ Entrée tardive viable"
+lateVerdictColor = not hasRecentSignal ? color.gray :
+                 remainingDist <= 0 ? color.new(#b71c1c, 20) :
+                 neededSlDist < minSlDistFloor ? color.new(#b71c1c, 20) :
+                 color.new(#1b5e20, 20)
+
+var table lateEntryTable = na
+
+if showLateEntryHelper and barstate.islast
+    lts = valTextSize(lateEntryTableSize)
+    lateEntryTable := table.new(tablePosition(lateEntryTablePos), columns=2, rows=6,
+                  bgcolor=color.new(#1a1a2e, 10),
+                  border_color=color.new(#ffffff, 60), border_width=1,
+                  frame_color=color.new(#ffffff, 40), frame_width=1)
+
+    lClrHdr = color.new(#2d2d4e, 0)
+    lClrWht = color.white
+    lClrYel = color.new(#ffeb3b, 0)
+    lClrGry = color.new(#aaaaaa, 0)
+    lClrNeu = color.new(#1a237e, 30)
+
+    table.cell(lateEntryTable, 0, 0, "⏰ ENTRÉE TARDIVE", text_color=lClrWht, bgcolor=lClrHdr, text_halign=text.align_left, text_size=lts)
+    table.cell(lateEntryTable, 1, 0, lastSignalType, text_color=lClrYel, bgcolor=lClrHdr, text_halign=text.align_center, text_size=lts)
+
+    table.cell(lateEntryTable, 0, 1, "Entrée actuelle (close)", text_color=lClrWht, bgcolor=lClrNeu, text_halign=text.align_left, text_size=lts)
+    table.cell(lateEntryTable, 1, 1, priceStr(liveEntryPx), text_color=lClrWht, bgcolor=lClrNeu, text_halign=text.align_center, text_size=lts)
+
+    table.cell(lateEntryTable, 0, 2, "TP visé (fixe)", text_color=lClrWht, bgcolor=lClrNeu, text_halign=text.align_left, text_size=lts)
+    table.cell(lateEntryTable, 1, 2, hasRecentSignal ? priceStr(lastSigTP) : "—", text_color=lClrYel, bgcolor=lClrNeu, text_halign=text.align_center, text_size=lts)
+
+    table.cell(lateEntryTable, 0, 3, "Distance restante", text_color=lClrWht, bgcolor=lClrNeu, text_halign=text.align_left, text_size=lts)
+    table.cell(lateEntryTable, 1, 3, (hasRecentSignal and remainingDist > 0) ? priceStr(remainingDist) : "—", text_color=lClrGry, bgcolor=lClrNeu, text_halign=text.align_center, text_size=lts)
+
+    table.cell(lateEntryTable, 0, 4, "SL suggéré (R:R " + str.tostring(lateEntryMinRR) + ")", text_color=lClrWht, bgcolor=lClrNeu, text_halign=text.align_left, text_size=lts)
+    table.cell(lateEntryTable, 1, 4, not na(liveSlPx) ? priceStr(liveSlPx) : "—", text_color=lClrYel, bgcolor=lClrNeu, text_halign=text.align_center, text_size=lts)
+
+    table.cell(lateEntryTable, 0, 5, "VERDICT", text_color=lClrWht, bgcolor=lClrHdr, text_halign=text.align_left, text_size=lts)
+    table.cell(lateEntryTable, 1, 5, lateVerdictTxt, text_color=color.white, bgcolor=lateVerdictColor, text_halign=text.align_center, text_size=lts)
+
+
+// ══════════════════════════════════════════
+//  PLOTS
+// ══════════════════════════════════════════
+plotshape(sweepBullFinal, text='⚡', color=sweepBullColor, textcolor=color.black, location=location.belowbar, offset=-sweepConfDelay, size=size.tiny)
+plotshape(sweepBearFinal, text='⚡', color=sweepBearColor, textcolor=color.white, location=location.abovebar, offset=-sweepConfDelay, size=size.tiny)
+plotshape(swingBullFinal, text='▲', color=swingBullColor, textcolor=color.black, location=location.belowbar, offset=-(lbRight), size=size.tiny)
+plotshape(swingBearFinal, text='▼', color=swingBearColor, textcolor=color.white, location=location.abovebar, offset=-(lbRight), size=size.tiny)
+
+plot(ema21, title="EMA 21", color=color.new(#26C6DA, 80), linewidth=1)
+plot(ema50, title="EMA 50", color=color.new(#FF7043, 80), linewidth=1)
+
+// ══════════════════════════════════════════
+//  ALERTCONDITIONS
+// ══════════════════════════════════════════
+alertcondition(swingBullFinal, title='▲ Swing Bull', message='SWING BULL | {{ticker}} [{{interval}}] | {{close}}')
+alertcondition(swingBearFinal, title='▼ Swing Bear', message='SWING BEAR | {{ticker}} [{{interval}}] | {{close}}')
+alertcondition(sweepBullFinal, title='⚡▲ Sweep Bull', message='SWEEP BULL | {{ticker}} [{{interval}}] | {{close}}')
+alertcondition(sweepBearFinal, title='⚡▼ Sweep Bear', message='SWEEP BEAR | {{ticker}} [{{interval}}] | {{close}}')
+alertcondition(swingBullFinal or swingBearFinal, title='📐 Any Swing', message='SWING | {{ticker}} [{{interval}}] | {{close}}')
+alertcondition(sweepBullFinal or sweepBearFinal, title='⚡ Any Sweep', message='SWEEP | {{ticker}} [{{interval}}] | {{close}}')
+alertcondition(swingBullFinal or swingBearFinal or sweepBullFinal or sweepBearFinal, title='🔔 Any Signal', message='Signal | {{ticker}} [{{interval}}] | {{close}}')
